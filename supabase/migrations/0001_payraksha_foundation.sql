@@ -1,731 +1,565 @@
--- =============================================================================
--- PayRaksha — Payment State & Recovery Intelligence
--- 0001_payraksha_foundation.sql
---
--- Schema + Row Level Security + Auth triggers + state-transition contract +
--- server-side ingest/role functions.
---
--- Security model (read before editing):
---   * Supabase Auth is the ONLY identity source. tenant_id / user_id / role are
---     NEVER accepted from the browser. Every tenant-sensitive row carries a
---     tenant_id and RLS derives the caller's tenant role from auth.uid() via
---     SECURITY DEFINER helpers.
---   * Roles: viewer (read) < operator (ingest + operations) < admin (policies,
---     roles) < super_admin (platform).
---   * payments.status is NEVER written directly by clients. It only changes
---     through ingest_payment_event(), which validates each event against the
---     state_transition_contract and persists a state_transitions row.
---   * No anonymous read/write policies exist. Service-role keys never reach the
---     browser; the client only ever talks to PostgREST as anon/authenticated.
---
--- Idempotent: safe to re-run in the Supabase SQL editor.
--- =============================================================================
+-- PayRaksha Foundation Schema
+-- Run this first: supabase/migrations/0001_payraksha_foundation.sql
 
-begin;
+-- ============================================================
+-- 0. Extensions
+-- ============================================================
+create extension if not exists "uuid-ossp";
 
--- ---------------------------------------------------------------------------
--- Reference / contract tables (not tenant-sensitive)
--- ---------------------------------------------------------------------------
-
--- Explicit, persisted state-transition contract. Mirrors
--- src/lib/payment-states.ts TRANSITIONS 1:1. A missing (event_type, from_state)
--- pair means the transition is invalid.
-create table if not exists public.state_transition_contract (
-    event_type text not null,
-    from_state text not null,
-    to_state   text not null,
-    note       text,
-    primary key (event_type, from_state)
+-- ============================================================
+-- 1. Tenants (multi-tenant root)
+-- ============================================================
+create table if not exists tenants (
+  id         uuid primary key default uuid_generate_v4(),
+  slug       text not null unique,
+  name       text not null,
+  created_at timestamptz not null default now()
 );
 
-insert into public.state_transition_contract (event_type, from_state, to_state, note) values
-    ('payment.created',        'FAILED',                'PENDING_REVIEW',        'Payment attempt registered'),
-    ('payment.authorized',     'FAILED',                'AUTHORIZED',            'Recovery retry authorized'),
-    ('payment.authorized',     'PENDING_REVIEW',        'AUTHORIZED',            'Funds hold confirmed'),
-    ('payment.captured',       'FAILED',                'CAPTURED_AFTER_FAILURE','Capture succeeds after earlier failure'),
-    ('payment.captured',       'AUTHORIZED',            'CAPTURED',              'Normal capture'),
-    ('payment.captured',       'PENDING_REVIEW',        'CAPTURED',              'Instant capture'),
-    ('payment.captured',       'RECOVERY_PENDING',      'CAPTURED_AFTER_FAILURE','Recovery capture succeeds'),
-    ('payment.failed',         'AUTHORIZED',            'RECOVERY_PENDING',      'Authorized payment failed -> recoverable'),
-    ('payment.failed',         'PENDING_REVIEW',        'FAILED',                'Attempt failed'),
-    ('payment.failed',         'RECOVERY_PENDING',      'RECOVERY_PENDING',      'Idempotent provider retransmission'),
-    ('payment.expired',        'AUTHORIZED',            'RECOVERY_PENDING',      'Auth window lapsed -> recoverable'),
-    ('payment.expired',        'RECOVERY_PENDING',      'FAILED',                'Recovery window lapsed'),
-    ('payment.expired',        'PENDING_REVIEW',        'FAILED',                'Attempt lapsed'),
-    ('recovery.initiated',     'FAILED',                'RECOVERY_PENDING',      'Recovery started for failed payment'),
-    ('recovery.initiated',     'AUTHORIZED',            'RECOVERY_PENDING',      'Auto-recovery started'),
-    ('recovery.initiated',     'RECOVERY_PENDING',      'RECOVERY_PENDING',      'Idempotent: already in recovery'),
-    ('recovery.cancelled',     'RECOVERY_PENDING',      'RECOVERY_CANCELLED',    'Operator cancels recovery'),
-    ('review.queued',          'FAILED',                'PENDING_REVIEW',        'Failed payment queued for manual review'),
-    ('review.queued',          'AUTHORIZED',            'PENDING_REVIEW',        'Flagged for manual review'),
-    ('review.queued',          'RECOVERY_PENDING',      'PENDING_REVIEW',        'Recovery paused for review'),
-    ('review.queued',          'RECOVERY_CANCELLED',    'PENDING_REVIEW',        'Re-opened for review'),
-    ('review.approved',        'PENDING_REVIEW',        'RECOVERY_PENDING',      'Review approves recovery path'),
-    ('review.rejected',        'PENDING_REVIEW',        'FAILED',                'Review rejects recovery'),
-    ('system.escalated',       'RECOVERY_PENDING',      'ESCALATED',             'Auto-recovery exhausted -> escalation'),
-    ('system.escalated',       'PENDING_REVIEW',        'ESCALATED',             'Escalated during review'),
-    ('system.escalated',       'FAILED',                'ESCALATED',             'Failed payment escalated'),
-    ('system.blocked',         'FAILED',                'BLOCKED',               'Risk rule blocks payment'),
-    ('system.blocked',         'RECOVERY_PENDING',      'BLOCKED',               'Risk rule blocks recovery'),
-    ('system.blocked',         'PENDING_REVIEW',        'BLOCKED',               'Risk rule blocks during review'),
-    ('system.blocked',         'AUTHORIZED',            'BLOCKED',               'Risk rule blocks authorized hold'),
-    ('system.released',        'BLOCKED',               'RECOVERY_PENDING',      'Super admin releases block'),
-    ('system.released',        'ESCALATED',             'RECOVERY_PENDING',      'Escalation resolved -> back to recovery'),
-    ('system.released',        'RECOVERY_CANCELLED',    'RECOVERY_PENDING',      'Re-opens recovery')
-on conflict (event_type, from_state) do update
-    set to_state = excluded.to_state, note = excluded.note;
-
--- ---------------------------------------------------------------------------
--- Tenants
--- ---------------------------------------------------------------------------
-
-create table if not exists public.tenants (
-    id         uuid primary key default gen_random_uuid(),
-    slug       text not null unique,
-    name       text not null,
-    created_at timestamptz not null default now()
+-- ============================================================
+-- 2. Profiles (extends auth.users)
+-- ============================================================
+create table if not exists profiles (
+  id         uuid primary key references auth.users(id) on delete cascade,
+  full_name  text,
+  avatar_url text,
+  created_at timestamptz not null default now()
 );
 
--- ---------------------------------------------------------------------------
--- Profiles (identity, user-global; membership lives in user_roles)
--- ---------------------------------------------------------------------------
+-- ============================================================
+-- 3. User roles (tenant × user × role)
+-- ============================================================
+create type app_role as enum ('viewer', 'operator', 'admin', 'super_admin');
 
-create table if not exists public.profiles (
-    id         uuid primary key references auth.users (id) on delete cascade,
-    email      text not null,
-    full_name  text,
-    created_at timestamptz not null default now()
+create table if not exists user_roles (
+  id         uuid primary key default uuid_generate_v4(),
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  tenant_id  uuid not null references tenants(id) on delete cascade,
+  role       app_role not null default 'viewer',
+  created_at timestamptz not null default now(),
+  unique(user_id, tenant_id)
 );
 
--- ---------------------------------------------------------------------------
--- Roles / memberships
--- ---------------------------------------------------------------------------
-
-create table if not exists public.user_roles (
-    user_id    uuid not null references auth.users (id) on delete cascade,
-    tenant_id  uuid not null references public.tenants (id) on delete cascade,
-    role       text not null check (role in ('viewer', 'operator', 'admin', 'super_admin')),
-    created_at timestamptz not null default now(),
-    primary key (user_id, tenant_id)
+-- ============================================================
+-- 4. Payments
+-- ============================================================
+create type payment_status as enum (
+  'FAILED', 'RECOVERY_PENDING', 'PENDING_REVIEW', 'AUTHORIZED',
+  'CAPTURED', 'CAPTURED_AFTER_FAILURE', 'RECOVERY_CANCELLED',
+  'ESCALATED', 'BLOCKED'
 );
 
--- ---------------------------------------------------------------------------
--- Payments — denormalized CURRENT state, maintained ONLY by ingest.
--- ---------------------------------------------------------------------------
-
-create table if not exists public.payments (
-    id           uuid primary key default gen_random_uuid(),
-    tenant_id    uuid not null references public.tenants (id) on delete cascade,
-    payment_ref  text not null,
-    amount       numeric(14, 2) not null check (amount > 0),
-    currency     text not null default 'USD',
-    method       text,
-    bank         text,
-    psp          text,
-    status       text not null default 'PENDING_REVIEW' check (status in (
-                     'FAILED', 'RECOVERY_PENDING', 'PENDING_REVIEW', 'AUTHORIZED',
-                     'CAPTURED', 'CAPTURED_AFTER_FAILURE', 'RECOVERY_CANCELLED',
-                     'ESCALATED', 'BLOCKED'
-                 )),
-    created_at   timestamptz not null default now(),
-    updated_at   timestamptz not null default now(),
-    unique (tenant_id, payment_ref)
+create table if not exists payments (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  payment_ref  text not null,
+  amount       numeric(12,2) not null,
+  currency     text not null default 'USD',
+  method       text,
+  bank         text,
+  psp          text,
+  status       payment_status not null default 'PENDING_REVIEW',
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique(tenant_id, payment_ref)
 );
 
-create index if not exists idx_payments_tenant_status on public.payments (tenant_id, status);
-
--- ---------------------------------------------------------------------------
--- Payment events — the persisted source of truth.
--- Dedup contract: UNIQUE(tenant_id, provider_event_id).
--- ---------------------------------------------------------------------------
-
-create table if not exists public.payment_events (
-    id                uuid primary key default gen_random_uuid(),
-    tenant_id         uuid not null references public.tenants (id) on delete cascade,
-    payment_id        uuid not null references public.payments (id) on delete cascade,
-    provider_event_id text not null,
-    event_type        text not null check (event_type in (
-                          'payment.created', 'payment.authorized', 'payment.captured',
-                          'payment.failed', 'payment.expired', 'recovery.initiated',
-                          'recovery.cancelled', 'review.queued', 'review.approved',
-                          'review.rejected', 'system.escalated', 'system.blocked',
-                          'system.released'
-                      )),
-    occurred_at       timestamptz not null,
-    raw_payload       jsonb not null default '{}'::jsonb,
-    ingested_at       timestamptz not null default now(),
-    unique (tenant_id, provider_event_id)
+-- ============================================================
+-- 5. Payment events (event-sourced history)
+-- ============================================================
+create table if not exists payment_events (
+  id                  uuid primary key default uuid_generate_v4(),
+  tenant_id           uuid not null references tenants(id),
+  payment_id          uuid not null references payments(id) on delete cascade,
+  provider_event_id   text not null,
+  event_type          text not null,
+  amount              numeric(12,2),
+  currency            text,
+  method              text,
+  bank                text,
+  psp                 text,
+  error_code          text,
+  error_description   text,
+  raw_payload         jsonb not null default '{}',
+  occurred_at         timestamptz not null default now(),
+  created_at          timestamptz not null default now(),
+  unique(tenant_id, provider_event_id)
 );
 
-create index if not exists idx_payment_events_payment_time
-    on public.payment_events (payment_id, occurred_at);
+create index if not exists idx_payment_events_payment_id on payment_events(payment_id);
+create index if not exists idx_payment_events_tenant on payment_events(tenant_id);
 
--- ---------------------------------------------------------------------------
--- State transitions — every applied or rejected transition, for audit/replay.
--- ---------------------------------------------------------------------------
-
-create table if not exists public.state_transitions (
-    id               uuid primary key default gen_random_uuid(),
-    tenant_id        uuid not null references public.tenants (id) on delete cascade,
-    payment_id       uuid not null references public.payments (id) on delete cascade,
-    payment_event_id uuid not null references public.payment_events (id) on delete cascade,
-    from_state       text not null,
-    to_state         text not null,
-    valid            boolean not null default true,
-    reason           text,
-    created_at       timestamptz not null default now()
+-- ============================================================
+-- 6. State transitions (audit trail of every state change)
+-- ============================================================
+create table if not exists state_transitions (
+  id              uuid primary key default uuid_generate_v4(),
+  tenant_id       uuid not null references tenants(id),
+  payment_id      uuid not null references payments(id) on delete cascade,
+  event_id        uuid references payment_events(id),
+  from_status     payment_status,
+  to_status       payment_status not null,
+  event_type      text not null,
+  applied_at      timestamptz not null default now(),
+  valid           boolean not null default true,
+  conflict_reason text
 );
 
-create index if not exists idx_state_transitions_payment
-    on public.state_transitions (payment_id, created_at);
+create index if not exists idx_state_transitions_payment on state_transitions(payment_id);
 
--- ---------------------------------------------------------------------------
--- Situations — detected anomalies tied to a payment (or systemic).
--- ---------------------------------------------------------------------------
+-- ============================================================
+-- 7. Situations (detected anomalies / conditions)
+-- ============================================================
+create type situation_severity as enum ('critical', 'high', 'medium', 'low');
 
-create table if not exists public.situations (
-    id          uuid primary key default gen_random_uuid(),
-    tenant_id   uuid not null references public.tenants (id) on delete cascade,
-    payment_id  uuid references public.payments (id) on delete cascade,
-    kind        text not null check (kind in (
-                    'duplicate_webhook', 'out_of_order_event', 'state_conflict',
-                    'card_expired', 'insufficient_balance', 'late_capture',
-                    'malformed_provider_response', 'systemic_psp_degradation',
-                    'payment_blocked', 'recovery_pending', 'escalated_payment',
-                    'review_required', 'unknown'
-                )),
-    severity    text not null default 'medium' check (severity in ('info', 'low', 'medium', 'high', 'critical')),
-    status      text not null default 'open' check (status in ('open', 'resolved', 'dismissed')),
-    summary     text,
-    detected_at timestamptz not null default now(),
-    resolved_at timestamptz
+create table if not exists situations (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  payment_id   uuid references payments(id) on delete set null,
+  kind         text not null,
+  severity     situation_severity not null default 'medium',
+  description  text,
+  metadata     jsonb not null default '{}',
+  resolved     boolean not null default false,
+  created_at   timestamptz not null default now()
 );
 
-create index if not exists idx_situations_tenant_status
-    on public.situations (tenant_id, status, detected_at);
+create index if not exists idx_situations_tenant on situations(tenant_id);
 
--- ---------------------------------------------------------------------------
--- Recovery actions — executed / pending recovery steps.
--- ---------------------------------------------------------------------------
-
-create table if not exists public.recovery_actions (
-    id              uuid primary key default gen_random_uuid(),
-    tenant_id       uuid not null references public.tenants (id) on delete cascade,
-    payment_id      uuid not null references public.payments (id) on delete cascade,
-    situation_id    uuid references public.situations (id) on delete set null,
-    action          text not null check (action in (
-                        'retry_capture', 'retry_authorization', 'reinitiate_recovery',
-                        'cancel_recovery', 'escalate', 'approve_review',
-                        'release_block', 'manual_review'
-                    )),
-    status          text not null default 'pending' check (status in ('pending', 'executed', 'skipped', 'failed')),
-    value_recovered numeric(14, 2) not null default 0,
-    executed_at     timestamptz,
-    created_at      timestamptz not null default now()
+-- ============================================================
+-- 8. Recovery actions
+-- ============================================================
+create table if not exists recovery_actions (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  payment_id   uuid references payments(id) on delete set null,
+  situation_id uuid references situations(id) on delete set null,
+  action_type  text not null,
+  status       text not null default 'pending',
+  result       jsonb,
+  created_at   timestamptz not null default now(),
+  completed_at timestamptz
 );
 
-create index if not exists idx_recovery_actions_tenant_status
-    on public.recovery_actions (tenant_id, status);
-
--- ---------------------------------------------------------------------------
--- Audit events — written ONLY server-side (never by a client insert).
--- ---------------------------------------------------------------------------
-
-create table if not exists public.audit_events (
-    id            uuid primary key default gen_random_uuid(),
-    tenant_id     uuid not null references public.tenants (id) on delete cascade,
-    actor_user_id uuid references auth.users (id) on delete set null,
-    actor_role    text check (actor_role in ('viewer', 'operator', 'admin', 'super_admin')),
-    action        text not null,
-    entity_type   text,
-    entity_id     text,
-    details       jsonb not null default '{}'::jsonb,
-    occurred_at   timestamptz not null default now()
+-- ============================================================
+-- 9. Audit events
+-- ============================================================
+create table if not exists audit_events (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  user_id      uuid references auth.users(id),
+  action       text not null,
+  entity_type  text,
+  entity_id    text,
+  actor_role   text,
+  details      jsonb not null default '{}',
+  occurred_at  timestamptz not null default now()
 );
 
-create index if not exists idx_audit_events_tenant_time
-    on public.audit_events (tenant_id, occurred_at desc);
+create index if not exists idx_audit_events_tenant on audit_events(tenant_id);
 
--- ---------------------------------------------------------------------------
--- Policies (recovery policy rules) and recovery-rate stats.
--- ---------------------------------------------------------------------------
-
-create table if not exists public.policies (
-    id          uuid primary key default gen_random_uuid(),
-    tenant_id   uuid not null references public.tenants (id) on delete cascade,
-    name        text not null,
-    description text,
-    enabled     boolean not null default true,
-    conditions  jsonb not null default '{}'::jsonb,
-    action      text not null,
-    created_at  timestamptz not null default now(),
-    updated_at  timestamptz not null default now()
+-- ============================================================
+-- 10. Policies (recovery / escalation rules)
+-- ============================================================
+create table if not exists policies (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  name         text not null,
+  description  text,
+  rule         jsonb not null default '{}',
+  enabled      boolean not null default true,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
 );
 
-create table if not exists public.recovery_rate_stats (
-    id               uuid primary key default gen_random_uuid(),
-    tenant_id        uuid not null references public.tenants (id) on delete cascade,
-    bucket_date      date not null,
-    attempted        integer not null default 0,
-    recovered        integer not null default 0,
-    recovered_amount numeric(14, 2) not null default 0,
-    rate             numeric(5, 4) not null default 0,
-    unique (tenant_id, bucket_date)
+-- ============================================================
+-- 11. Recovery rate stats (materialised aggregates)
+-- ============================================================
+create table if not exists recovery_rate_stats (
+  id           uuid primary key default uuid_generate_v4(),
+  tenant_id    uuid not null references tenants(id),
+  period_start timestamptz not null,
+  period_end   timestamptz not null,
+  total_payments     int not null default 0,
+  recovered          int not null default 0,
+  failed             int not null default 0,
+  escalated          int not null default 0,
+  blocked            int not null default 0,
+  recovery_rate      numeric(5,4),
+  avg_recovery_hours numeric(8,2),
+  created_at   timestamptz not null default now()
 );
 
--- ---------------------------------------------------------------------------
--- Grants. RLS (below) does the actual per-row enforcement.
--- ---------------------------------------------------------------------------
+-- ============================================================
+-- 12. State transition contract (immutable rules)
+-- ============================================================
+create table if not exists state_transition_contract (
+  id          uuid primary key default uuid_generate_v4(),
+  event_type  text not null,
+  from_status payment_status not null,
+  to_status   payment_status not null,
+  description text,
+  unique(event_type, from_status)
+);
 
-grant usage on schema public to anon, authenticated;
+-- Seed the contract
+insert into state_transition_contract (event_type, from_status, to_status, description) values
+  ('payment.created',      'PENDING_REVIEW', 'PENDING_REVIEW', 'Initial creation'),
+  ('payment.authorized',   'FAILED',         'AUTHORIZED',     'Authorization received'),
+  ('payment.authorized',   'PENDING_REVIEW', 'AUTHORIZED',     'Authorization received'),
+  ('payment.captured',     'AUTHORIZED',     'CAPTURED',       'Capture succeeded'),
+  ('payment.captured',     'PENDING_REVIEW', 'CAPTURED',       'Capture succeeded'),
+  ('payment.captured',     'FAILED',         'CAPTURED_AFTER_FAILURE', 'Capture after initial failure'),
+  ('payment.captured',     'RECOVERY_PENDING','CAPTURED_AFTER_FAILURE','Capture during recovery'),
+  ('payment.failed',       'AUTHORIZED',     'RECOVERY_PENDING','Authorization failed'),
+  ('payment.failed',       'PENDING_REVIEW', 'FAILED',         'Payment failed'),
+  ('payment.failed',       'RECOVERY_PENDING','RECOVERY_PENDING','Retry failed (idempotent)'),
+  ('payment.expired',      'AUTHORIZED',     'RECOVERY_PENDING','Authorization expired'),
+  ('payment.expired',      'RECOVERY_PENDING','FAILED',         'Recovery expired'),
+  ('payment.expired',      'PENDING_REVIEW', 'FAILED',         'Expired in review'),
+  ('recovery.initiated',   'FAILED',         'RECOVERY_PENDING','Recovery started'),
+  ('recovery.initiated',   'AUTHORIZED',     'RECOVERY_PENDING','Recovery started'),
+  ('recovery.initiated',   'RECOVERY_PENDING','RECOVERY_PENDING','Recovery retry (idempotent)'),
+  ('recovery.cancelled',   'RECOVERY_PENDING','RECOVERY_CANCELLED','Recovery cancelled'),
+  ('review.queued',        'FAILED',         'PENDING_REVIEW', 'Queued for review'),
+  ('review.queued',        'AUTHORIZED',     'PENDING_REVIEW', 'Queued for review'),
+  ('review.queued',        'RECOVERY_PENDING','PENDING_REVIEW','Queued for review'),
+  ('review.queued',        'RECOVERY_CANCELLED','PENDING_REVIEW','Queued for review'),
+  ('review.approved',      'PENDING_REVIEW', 'RECOVERY_PENDING','Review approved'),
+  ('review.rejected',      'PENDING_REVIEW', 'FAILED',         'Review rejected'),
+  ('system.escalated',     'RECOVERY_PENDING','ESCALATED',     'System escalation'),
+  ('system.escalated',     'PENDING_REVIEW', 'ESCALATED',      'System escalation'),
+  ('system.escalated',     'FAILED',         'ESCALATED',      'System escalation'),
+  ('system.blocked',       'FAILED',         'BLOCKED',        'System block'),
+  ('system.blocked',       'RECOVERY_PENDING','BLOCKED',       'System block'),
+  ('system.blocked',       'PENDING_REVIEW', 'BLOCKED',        'System block'),
+  ('system.blocked',       'AUTHORIZED',     'BLOCKED',        'System block'),
+  ('system.released',      'BLOCKED',        'RECOVERY_PENDING','System release'),
+  ('system.released',      'ESCALATED',      'RECOVERY_PENDING','System release'),
+  ('system.released',      'RECOVERY_CANCELLED','RECOVERY_PENDING','System release')
+on conflict (event_type, from_status) do nothing;
 
-grant select on public.state_transition_contract to anon, authenticated;
+-- ============================================================
+-- 13. SECURITY DEFINER functions
+-- ============================================================
 
-grant select, insert, update, delete on
-    public.tenants, public.profiles, public.user_roles, public.payments,
-    public.payment_events, public.state_transitions, public.situations,
-    public.recovery_actions, public.audit_events, public.policies,
-    public.recovery_rate_stats
-    to authenticated;
-
--- ---------------------------------------------------------------------------
--- RLS enablement + policies. NO anonymous access anywhere.
--- ---------------------------------------------------------------------------
-
-alter table public.tenants              enable row level security;
-alter table public.profiles             enable row level security;
-alter table public.user_roles           enable row level security;
-alter table public.payments             enable row level security;
-alter table public.payment_events       enable row level security;
-alter table public.state_transitions    enable row level security;
-alter table public.situations           enable row level security;
-alter table public.recovery_actions     enable row level security;
-alter table public.audit_events         enable row level security;
-alter table public.policies             enable row level security;
-alter table public.recovery_rate_stats  enable row level security;
-
--- Security helper functions used by policies and RPCs.
-create or replace function public.role_rank(p_role text)
-returns integer
+-- Get current user's tenant_id and role (from auth session)
+create or replace function get_current_user_tenant()
+returns table(tenant_id uuid, role app_role)
 language sql
-immutable
 security definer
-set search_path = public, pg_temp
-as $$
-    select case p_role
-        when 'viewer'      then 1
-        when 'operator'    then 2
-        when 'admin'       then 3
-        when 'super_admin' then 4
-        else 0
-    end;
-$$;
-
-create or replace function public.current_tenant_role(p_tenant_id uuid)
-returns text
-language plpgsql
 stable
-security definer
-set search_path = public, pg_temp
 as $$
-declare v_role text;
-begin
-    select role into v_role
-      from public.user_roles
-     where user_id = auth.uid() and tenant_id = p_tenant_id
-     limit 1;
-    return v_role;
-end;
+  select ur.tenant_id, ur.role
+  from user_roles ur
+  where ur.user_id = auth.uid()
+  limit 1;
 $$;
 
-create or replace function public.has_role(p_tenant_id uuid, p_min_role text)
+-- Check if user has at least the given role level
+create or replace function user_has_role(min_role app_role)
 returns boolean
 language sql
-stable
 security definer
-set search_path = public, pg_temp
+stable
 as $$
-    select p_min_role in ('viewer', 'operator', 'admin', 'super_admin')
-       and public.role_rank(public.current_tenant_role(p_tenant_id)) >= public.role_rank(p_min_role);
+  select exists (
+    select 1 from user_roles ur
+    where ur.user_id = auth.uid()
+    and (
+      ur.role = min_role
+      or (ur.role = 'operator' and min_role = 'viewer')
+      or (ur.role = 'admin' and min_role in ('viewer', 'operator'))
+      or (ur.role = 'super_admin')
+    )
+  );
 $$;
 
-create or replace function public.shares_tenant(p_user_a uuid, p_user_b uuid)
-returns boolean
+-- List current user's tenants with roles
+create or replace function list_my_tenants()
+returns table(tenant_id uuid, slug text, name text, role app_role)
 language sql
-stable
 security definer
-set search_path = public, pg_temp
+stable
 as $$
-    select exists (
-        select 1
-          from public.user_roles a
-          join public.user_roles b on b.tenant_id = a.tenant_id
-         where a.user_id = p_user_a and b.user_id = p_user_b
-    );
+  select t.id, t.slug, t.name, ur.role
+  from user_roles ur
+  join tenants t on t.id = ur.tenant_id
+  where ur.user_id = auth.uid()
+  order by t.name;
 $$;
 
--- Helpers are called from policy expressions by anon/authenticated, so they
--- need execute. They are read-only and derive everything from auth.uid().
-grant execute on function public.role_rank(text) to anon, authenticated;
-grant execute on function public.current_tenant_role(uuid) to anon, authenticated;
-grant execute on function public.has_role(uuid, text) to anon, authenticated;
-grant execute on function public.shares_tenant(uuid, uuid) to anon, authenticated;
-
--- tenants: visible to members
-drop policy if exists "tenant select for members" on public.tenants;
-create policy "tenant select for members" on public.tenants
-    for select using (public.has_role(id, 'viewer'));
-
--- profiles: self, or shares a tenant (roster/audit display)
-drop policy if exists "profile select own or shared tenant" on public.profiles;
-create policy "profile select own or shared tenant" on public.profiles
-    for select using (auth.uid() = id or public.shares_tenant(id, auth.uid()));
-
-drop policy if exists "profile update own" on public.profiles;
-create policy "profile update own" on public.profiles
-    for update using (auth.uid() = id) with check (auth.uid() = id);
-
--- user_roles: members see their own memberships; admins see the tenant roster.
--- All writes go through set_user_role().
-drop policy if exists "role select own or admin roster" on public.user_roles;
-create policy "role select own or admin roster" on public.user_roles
-    for select using (auth.uid() = user_id or public.has_role(tenant_id, 'admin'));
-
--- Tenant data tables: viewer reads; writes only via server-side RPCs.
-drop policy if exists "payments select viewer" on public.payments;
-create policy "payments select viewer" on public.payments
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "payment_events select viewer" on public.payment_events;
-create policy "payment_events select viewer" on public.payment_events
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "state_transitions select viewer" on public.state_transitions;
-create policy "state_transitions select viewer" on public.state_transitions
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "situations select viewer" on public.situations;
-create policy "situations select viewer" on public.situations
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "recovery_actions select viewer" on public.recovery_actions;
-create policy "recovery_actions select viewer" on public.recovery_actions
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "audit_events select viewer" on public.audit_events;
-create policy "audit_events select viewer" on public.audit_events
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "policies select viewer" on public.policies;
-create policy "policies select viewer" on public.policies
-    for select using (public.has_role(tenant_id, 'viewer'));
-
-drop policy if exists "recovery_rate_stats select viewer" on public.recovery_rate_stats;
-create policy "recovery_rate_stats select viewer" on public.recovery_rate_stats
-    for select using (public.has_role(tenant_id, 'viewer'));
-
--- ---------------------------------------------------------------------------
--- Server-side RPCs (SECURITY DEFINER; identity always from auth.uid()).
--- ---------------------------------------------------------------------------
-
--- Internal audit writer used by RPCs.
-create or replace function public.record_audit(
-    p_tenant_id   uuid,
-    p_action      text,
-    p_entity_type text default null,
-    p_entity_id   text default null,
-    p_details     jsonb default '{}'::jsonb
+-- Set user role (admin+ only)
+create or replace function set_user_role(
+  p_user_id uuid,
+  p_tenant_id uuid,
+  p_role app_role
 )
 returns void
 language plpgsql
 security definer
-set search_path = public, pg_temp
 as $$
 begin
-    insert into public.audit_events (tenant_id, actor_user_id, actor_role, action, entity_type, entity_id, details)
-    values (
-        p_tenant_id,
-        auth.uid(),
-        public.current_tenant_role(p_tenant_id),
-        p_action,
-        p_entity_type,
-        p_entity_id,
-        coalesce(p_details, '{}'::jsonb)
-    );
+  if not user_has_role('admin') then
+    raise exception 'Insufficient permissions: admin role required';
+  end if;
+
+  insert into user_roles (user_id, tenant_id, role)
+  values (p_user_id, p_tenant_id, p_role)
+  on conflict (user_id, tenant_id)
+  do update set role = p_role;
 end;
 $$;
 
--- List the caller's tenants + role. The browser never supplies a tenant_id to
--- "choose" — the server derives membership from the Supabase session.
-create or replace function public.list_my_tenants()
-returns table (tenant_id uuid, slug text, name text, role text)
-language sql
-security definer
-set search_path = public, pg_temp
-as $$
-    select t.id, t.slug, t.name, ur.role
-      from public.user_roles ur
-      join public.tenants t on t.id = ur.tenant_id
-     where ur.user_id = auth.uid()
-     order by ur.role desc, t.name;
-$$;
-
--- Grant or change a role inside a tenant (admin+; only super_admin manages
--- super_admin). Never trusts a role claim from the client.
-create or replace function public.set_user_role(
-    p_tenant_id     uuid,
-    p_target_user_id uuid,
-    p_new_role      text
-)
-returns text
-language plpgsql
-security definer
-set search_path = public, pg_temp
-as $$
-declare
-    v_actor_role text := public.current_tenant_role(p_tenant_id);
-begin
-    if auth.uid() is null then
-        raise exception 'Not signed in' using errcode = '42501';
-    end if;
-    if v_actor_role is null or public.role_rank(v_actor_role) < public.role_rank('admin') then
-        raise exception 'Admin or super_admin role required to manage roles' using errcode = '42501';
-    end if;
-    if p_new_role not in ('viewer', 'operator', 'admin', 'super_admin') then
-        raise exception 'Unknown role: %', p_new_role;
-    end if;
-    if p_new_role = 'super_admin' and v_actor_role <> 'super_admin' then
-        raise exception 'Only a super_admin can grant super_admin' using errcode = '42501';
-    end if;
-
-    -- The target must exist as a profile; never fabricate identity.
-    if not exists (select 1 from auth.users where id = p_target_user_id) then
-        raise exception 'Target user does not exist in Supabase Auth' using errcode = 'P0001';
-    end if;
-    insert into public.profiles (id, email)
-    values (p_target_user_id, coalesce((select email from auth.users where id = p_target_user_id), 'unknown'))
-    on conflict (id) do nothing;
-
-    insert into public.user_roles (user_id, tenant_id, role)
-    values (p_target_user_id, p_tenant_id, p_new_role)
-    on conflict (user_id, tenant_id)
-    do update set role = excluded.role;
-
-    perform public.record_audit(
-        p_tenant_id,
-        'role.assigned',
-        'user_roles',
-        p_target_user_id::text,
-        jsonb_build_object('target_user_id', p_target_user_id, 'role', p_new_role, 'by_user_id', auth.uid())
-    );
-    return p_new_role;
-end;
-$$;
-
--- Ingest a single provider payment event (operator+). This is the ONLY path
--- that changes payments.status. Steps: verify role -> ensure payment -> dedup
--- event on UNIQUE(tenant_id, provider_event_id) -> validate against the
--- transition contract -> persist state_transitions + audit. Invalid and
--- duplicate events are surfaced, never swallowed.
-create or replace function public.ingest_payment_event(
-    p_tenant_id          uuid,
-    p_payment_ref        text,
-    p_provider_event_id  text,
-    p_event_type         text,
-    p_occurred_at        timestamptz default now(),
-    p_amount             numeric(14, 2) default null,
-    p_currency           text default 'USD',
-    p_method             text default null,
-    p_bank               text default null,
-    p_psp                text default null,
-    p_error_code         text default null,
-    p_error_description  text default null,
-    p_raw_payload        jsonb default '{}'::jsonb
+-- Ingest payment event with dedup and state reconstruction
+create or replace function ingest_payment_event(
+  p_tenant_id uuid,
+  p_payment_ref text,
+  p_provider_event_id text,
+  p_event_type text,
+  p_amount numeric default null,
+  p_currency text default null,
+  p_method text default null,
+  p_bank text default null,
+  p_psp text default null,
+  p_error_code text default null,
+  p_error_description text default null,
+  p_raw_payload jsonb default '{}',
+  p_occurred_at timestamptz default now()
 )
 returns jsonb
 language plpgsql
 security definer
-set search_path = public, pg_temp
 as $$
 declare
-    v_payment_id      uuid;
-    v_event_id        uuid;
-    v_current_status  text;
-    v_to_state        text;
-    v_payload         jsonb := coalesce(p_raw_payload, '{}'::jsonb);
+  v_payment_id uuid;
+  v_current_status payment_status;
+  v_new_status payment_status;
+  v_event_id uuid;
+  v_is_duplicate boolean := false;
+  v_contract record;
+  v_result jsonb;
 begin
-    if auth.uid() is null then
-        raise exception 'Not signed in' using errcode = '42501';
-    end if;
-    if not public.has_role(p_tenant_id, 'operator') then
-        raise exception 'Operator or above role required to ingest events' using errcode = '42501';
-    end if;
-    if not exists (select 1 from public.state_transition_contract where event_type = p_event_type) then
-        raise exception 'Unknown event type: %', p_event_type;
-    end if;
-    if p_payment_ref is null or p_provider_event_id is null then
-        raise exception 'payment_ref and provider_event_id are required';
-    end if;
-    if p_amount is null or p_amount <= 0 then
-        raise exception 'A positive amount is required when ingesting an event';
-    end if;
+  -- Check operator+ role
+  if not user_has_role('operator') then
+    raise exception 'Insufficient permissions: operator role required';
+  end if;
 
-    -- Ensure the payment shell exists WITHOUT touching its status.
-    insert into public.payments (tenant_id, payment_ref, amount, currency, method, bank, psp)
-    values (p_tenant_id, p_payment_ref, p_amount, coalesce(p_currency, 'USD'),
-            p_method, p_bank, p_psp)
-    on conflict (tenant_id, payment_ref) do update
-        set method = coalesce(excluded.method, payments.method),
-            bank   = coalesce(excluded.bank, payments.bank),
-            psp    = coalesce(excluded.psp, payments.psp),
-            updated_at = now()
-    returning id, status into v_payment_id, v_current_status;
+  -- Upsert payment if needed
+  insert into payments (tenant_id, payment_ref, amount, currency, method, bank, psp, status)
+  values (p_tenant_id, p_payment_ref, coalesce(p_amount, 0), coalesce(p_currency, 'USD'), p_method, p_bank, p_psp, 'PENDING_REVIEW')
+  on conflict (tenant_id, payment_ref) do nothing
+  returning id into v_payment_id;
 
-    v_payload := v_payload
-        || jsonb_build_object(
-               'amount', p_amount,
-               'currency', p_currency,
-               'method', p_method,
-               'bank', p_bank,
-               'psp', p_psp,
-               'error_code', p_error_code,
-               'error_description', p_error_description
-           );
+  if v_payment_id is null then
+    select id into v_payment_id from payments where tenant_id = p_tenant_id and payment_ref = p_payment_ref;
+  end if;
 
-    -- Dedup contract: UNIQUE(tenant_id, provider_event_id). A retransmitted
-    -- webhook is absorbed here and surfaced as an audit event.
-    insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
-    values (p_tenant_id, v_payment_id, p_provider_event_id, p_event_type, coalesce(p_occurred_at, now()), v_payload)
-    on conflict (tenant_id, provider_event_id) do nothing
-    returning id into v_event_id;
+  -- Check for duplicate event
+  insert into payment_events (tenant_id, payment_id, provider_event_id, event_type, amount, currency, method, bank, psp, error_code, error_description, raw_payload, occurred_at)
+  values (p_tenant_id, v_payment_id, p_provider_event_id, p_event_type, p_amount, p_currency, p_method, p_bank, p_psp, p_error_code, p_error_description, p_raw_payload, p_occurred_at)
+  on conflict (tenant_id, provider_event_id) do nothing
+  returning id into v_event_id;
 
-    if v_event_id is null then
-        perform public.record_audit(
-            p_tenant_id, 'webhook.duplicate_suppressed', 'payment_events',
-            v_payment_id::text,
-            jsonb_build_object('provider_event_id', p_provider_event_id, 'event_type', p_event_type)
-        );
-        return jsonb_build_object(
-            'payment_id', v_payment_id,
-            'status', v_current_status,
-            'applied', false,
-            'deduplicated', true,
-            'payment_event_id', null
-        );
-    end if;
+  if v_event_id is null then
+    v_is_duplicate := true;
+    v_result := jsonb_build_object('ok', true, 'duplicate', true, 'payment_id', v_payment_id);
+    return v_result;
+  end if;
 
-    -- Validate against the persisted transition contract.
-    select to_state into v_to_state
-      from public.state_transition_contract
-     where event_type = p_event_type and from_state = v_current_status;
+  -- Get current status
+  select status into v_current_status from payments where id = v_payment_id;
 
-    if v_to_state is null then
-        insert into public.state_transitions
-            (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason)
-        values (p_tenant_id, v_payment_id, v_event_id, v_current_status, v_current_status, false,
-                'Invalid transition: ' || p_event_type || ' not allowed from ' || v_current_status);
+  -- Look up valid transition
+  select into v_contract *
+  from state_transition_contract
+  where event_type = p_event_type and from_status = v_current_status;
 
-        if not exists (
-            select 1 from public.situations
-             where tenant_id = p_tenant_id and payment_id = v_payment_id
-               and kind = 'state_conflict' and status = 'open'
-        ) then
-            insert into public.situations (tenant_id, payment_id, kind, severity, status, summary)
-            values (p_tenant_id, v_payment_id, 'state_conflict', 'high', 'open',
-                    p_event_type || ' rejected from ' || v_current_status || ' — guardrail enforced');
-        end if;
+  if v_contract is not null then
+    v_new_status := v_contract.to_status;
 
-        perform public.record_audit(
-            p_tenant_id, 'state.conflict_rejected', 'payments',
-            v_payment_id::text,
-            jsonb_build_object('event_type', p_event_type, 'from_state', v_current_status, 'provider_event_id', p_provider_event_id)
-        );
-        return jsonb_build_object(
-            'payment_id', v_payment_id,
-            'status', v_current_status,
-            'applied', false,
-            'conflict', true,
-            'payment_event_id', v_event_id
-        );
-    end if;
+    -- Record transition
+    insert into state_transitions (tenant_id, payment_id, event_id, from_status, to_status, event_type, valid)
+    values (p_tenant_id, v_payment_id, v_event_id, v_current_status, v_new_status, p_event_type, true);
 
-    -- The only writer of payments.status in the whole system.
-    update public.payments
-       set status = v_to_state, updated_at = now()
-     where id = v_payment_id;
+    -- Update payment status
+    update payments set status = v_new_status, updated_at = now() where id = v_payment_id;
 
-    insert into public.state_transitions
-        (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason)
-    values (p_tenant_id, v_payment_id, v_event_id, v_current_status, v_to_state, true,
-            p_event_type);
-
-    perform public.record_audit(
-        p_tenant_id, 'event.applied', 'payments',
-        v_payment_id::text,
-        jsonb_build_object('event_type', p_event_type, 'from_state', v_current_status,
-                           'to_state', v_to_state, 'provider_event_id', p_provider_event_id)
+    v_result := jsonb_build_object(
+      'ok', true,
+      'duplicate', false,
+      'payment_id', v_payment_id,
+      'event_id', v_event_id,
+      'from_status', v_current_status,
+      'to_status', v_new_status,
+      'valid', true
     );
+  else
+    -- Invalid transition — still record it
+    insert into state_transitions (tenant_id, payment_id, event_id, from_status, to_status, event_type, valid, conflict_reason)
+    values (p_tenant_id, v_payment_id, v_event_id, v_current_status, v_current_status, p_event_type, false, 'No valid transition from ' || v_current_status || ' for ' || p_event_type);
 
-    return jsonb_build_object(
-        'payment_id', v_payment_id,
-        'payment_ref', p_payment_ref,
-        'from_status', v_current_status,
-        'status', v_to_state,
-        'applied', true,
-        'deduplicated', false,
-        'conflict', false,
-        'payment_event_id', v_event_id
+    v_result := jsonb_build_object(
+      'ok', true,
+      'duplicate', false,
+      'payment_id', v_payment_id,
+      'event_id', v_event_id,
+      'from_status', v_current_status,
+      'to_status', v_current_status,
+      'valid', false,
+      'conflict', 'Invalid transition: ' || p_event_type || ' not allowed from ' || v_current_status
     );
+  end if;
+
+  -- Write audit event
+  insert into audit_events (tenant_id, user_id, action, entity_type, entity_id, actor_role, details)
+  values (p_tenant_id, auth.uid(), 'ingest_event', 'payment_events', v_event_id::text, (select role::text from user_roles where user_id = auth.uid() and tenant_id = p_tenant_id limit 1), v_result);
+
+  return v_result;
 end;
 $$;
 
-grant execute on function public.record_audit(uuid, text, text, text, jsonb) to authenticated;
-grant execute on function public.list_my_tenants() to authenticated;
-grant execute on function public.set_user_role(uuid, uuid, text) to authenticated;
-grant execute on function public.ingest_payment_event(uuid, text, text, text, timestamptz, numeric, text, text, text, text, text, text, jsonb) to authenticated;
-
--- Explicitly keep RPCs out of anon's hands (policies still need the helpers).
-revoke execute on function public.record_audit(uuid, text, text, text, jsonb) from public, anon;
-revoke execute on function public.list_my_tenants() from public, anon;
-revoke execute on function public.set_user_role(uuid, uuid, text) from public, anon;
-revoke execute on function public.ingest_payment_event(uuid, text, text, text, timestamptz, numeric, text, text, text, text, text, text, jsonb) from public, anon;
-
--- ---------------------------------------------------------------------------
--- Auth triggers: every new Supabase Auth user gets a profile + a viewer role
--- in the demo tenant (if it exists). The org admin is later promoted with a
--- one-line UPDATE — the plaintext password never appears in code or SQL.
--- ---------------------------------------------------------------------------
-
-create or replace function public.handle_new_auth_user()
+-- ============================================================
+-- 14. Auto-create profile on user signup
+-- ============================================================
+create or replace function on_auth_user_created()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, pg_temp
 as $$
-declare
-    v_demo_tenant uuid;
 begin
-    insert into public.profiles (id, email, full_name)
-    values (
-        new.id,
-        coalesce(new.email, ''),
-        coalesce(new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'name')
-    )
-    on conflict (id) do nothing;
+  insert into profiles (id, full_name)
+  values (new.id, coalesce(new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'name'));
 
-    select id into v_demo_tenant from public.tenants where slug = 'demo';
-    if v_demo_tenant is not null then
-        insert into public.user_roles (user_id, tenant_id, role)
-        values (new.id, v_demo_tenant, 'viewer')
-        on conflict (user_id, tenant_id) do nothing;
-    end if;
-    return new;
+  -- Auto-assign viewer role in demo tenant if it exists
+  insert into user_roles (user_id, tenant_id, role)
+  select new.id, t.id, 'viewer'
+  from tenants t
+  where t.slug = 'demo'
+  on conflict (user_id, tenant_id) do nothing;
+
+  return new;
 end;
 $$;
 
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
-    after insert on auth.users
-    for each row execute function public.handle_new_auth_user();
+  after insert on auth.users
+  for each row execute function on_auth_user_created();
 
-commit;
+-- ============================================================
+-- 15. ROW LEVEL SECURITY
+-- ============================================================
+
+-- Enable RLS on all tenant-sensitive tables
+alter table payments enable row level security;
+alter table payment_events enable row level security;
+alter table state_transitions enable row level security;
+alter table situations enable row level security;
+alter table recovery_actions enable row level security;
+alter table audit_events enable row level security;
+alter table policies enable row level security;
+alter table recovery_rate_stats enable row level security;
+alter table user_roles enable row level security;
+alter table profiles enable row level security;
+
+-- Payments: viewer+ can read, operator+ can ingest (writes go through function)
+create policy "payments_select" on payments
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- Payment events: viewer+ can read
+create policy "payment_events_select" on payment_events
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- State transitions: viewer+ can read
+create policy "state_transitions_select" on state_transitions
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- Situations: viewer+ can read, operator+ can update (resolve)
+create policy "situations_select" on situations
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+create policy "situations_update" on situations
+  for update using (
+    tenant_id in (
+      select tenant_id from user_roles
+      where user_id = auth.uid() and role in ('operator', 'admin', 'super_admin')
+    )
+  );
+
+-- Recovery actions: viewer+ can read
+create policy "recovery_actions_select" on recovery_actions
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- Audit events: viewer+ can read
+create policy "audit_events_select" on audit_events
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- Policies: viewer+ can read, admin+ can modify
+create policy "policies_select" on policies
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+create policy "policies_insert" on policies
+  for insert with check (
+    tenant_id in (
+      select tenant_id from user_roles
+      where user_id = auth.uid() and role in ('admin', 'super_admin')
+    )
+  );
+
+create policy "policies_update" on policies
+  for update using (
+    tenant_id in (
+      select tenant_id from user_roles
+      where user_id = auth.uid() and role in ('admin', 'super_admin')
+    )
+  );
+
+-- Recovery rate stats: viewer+ can read
+create policy "recovery_rate_stats_select" on recovery_rate_stats
+  for select using (
+    tenant_id in (select tenant_id from user_roles where user_id = auth.uid())
+  );
+
+-- User roles: users can see their own; admin+ can see all in their tenant
+create policy "user_roles_select_own" on user_roles
+  for select using (user_id = auth.uid());
+
+create policy "user_roles_select_tenant" on user_roles
+  for select using (
+    tenant_id in (
+      select tenant_id from user_roles
+      where user_id = auth.uid() and role in ('admin', 'super_admin')
+    )
+  );
+
+-- Profiles: users can see their own; admin+ can see all
+create policy "profiles_select_own" on profiles
+  for select using (id = auth.uid());
+
+create policy "profiles_select_admin" on profiles
+  for select using (
+    exists (
+      select 1 from user_roles
+      where user_id = auth.uid() and role in ('admin', 'super_admin')
+    )
+  );
+
+-- State transition contract: readable by all authenticated users
+alter table state_transition_contract enable row level security;
+create policy "stc_select" on state_transition_contract
+  for select using (auth.uid() is not null);

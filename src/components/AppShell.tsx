@@ -17,6 +17,9 @@ import {
   Menu,
   Settings,
   ShieldCheck,
+  AlertTriangle,
+  BookOpen,
+  ClipboardList,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
@@ -27,13 +30,21 @@ const NAV_SECTIONS = [
   {
     label: "Operations",
     items: [
-      { to: "/dashboard", label: "Overview", icon: LayoutDashboard },
+      { to: "/dashboard", label: "Command Center", icon: LayoutDashboard },
       { to: "/payments", label: "Payments", icon: CreditCard },
       { to: "/investigations", label: "Investigations", icon: FileSearch },
+      { to: "/investigations", label: "Incidents", icon: AlertTriangle },
     ],
   },
   {
-    label: "Workspace",
+    label: "Control",
+    items: [
+      { to: "/settings", label: "Policies", icon: BookOpen },
+      { to: "/settings", label: "Audit", icon: ClipboardList },
+    ],
+  },
+  {
+    label: "Admin",
     items: [
       { to: "/settings", label: "Settings", icon: Settings },
       { to: "/admin", label: "Admin", icon: ShieldCheck },
@@ -49,10 +60,10 @@ function Brand() {
       </span>
       <span className="leading-tight">
         <span className="block text-sm font-semibold tracking-tight text-sidebar-foreground">
-          Meridian
+          PayRaksha
         </span>
         <span className="block text-[11px] text-muted-foreground">
-          Payments &amp; risk ops
+          Payment Intelligence
         </span>
       </span>
     </NavLink>
@@ -69,7 +80,7 @@ function NavItems({ onNavigate }: { onNavigate?: () => void }) {
           </p>
           <ul className="flex flex-col gap-1">
             {section.items.map((item) => (
-              <li key={item.to}>
+              <li key={item.label}>
                 <NavLink
                   to={item.to}
                   onClick={onNavigate}
@@ -196,13 +207,27 @@ export function AppShell({ children }: { children: ReactNode }) {
 }
 
 export function RoleBadge({ role }: { role?: string | null }) {
-  if (!role || role === "member") {
-    return <Badge variant="secondary">member</Badge>;
+  if (!role) {
+    return <Badge variant="secondary">viewer</Badge>;
+  }
+  if (role === "super_admin") {
+    return (
+      <Badge className="border-transparent bg-danger/15 text-danger">
+        super admin
+      </Badge>
+    );
   }
   if (role === "admin") {
     return (
       <Badge className="border-transparent bg-accent-tint text-accent-foreground">
         admin
+      </Badge>
+    );
+  }
+  if (role === "operator") {
+    return (
+      <Badge className="border-transparent bg-success/15 text-success">
+        operator
       </Badge>
     );
   }

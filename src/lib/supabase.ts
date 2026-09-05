@@ -186,3 +186,169 @@ export async function hasSupabaseSession(): Promise<boolean> {
     return false;
   }
 }
+
+// ── Dashboard metrics ──────────────────────────────────────────────
+
+export interface DashboardMetrics {
+  totalPayments: number;
+  totalVolume: number;
+  successRate: number;
+  underReview: number;
+  statusDistribution: Record<string, number>;
+}
+
+/** Aggregate dashboard metrics for a tenant. */
+export async function fetchDashboardMetrics(
+  tenantId: string,
+): Promise<SupabaseResult<DashboardMetrics>> {
+  if (!supabase) return configError();
+  try {
+    const { data: payments, error } = await supabase
+      .from("payments")
+      .select("status, amount")
+      .eq("tenant_id", tenantId);
+    if (error) return { ok: false, reason: "request", error: error.message };
+    const rows = (payments ?? []) as { status: string; amount: number }[];
+    const totalPayments = rows.length;
+    const totalVolume = rows.reduce((s, r) => s + (r.amount ?? 0), 0);
+    const captured = rows.filter((r) => r.status === "CAPTURED" || r.status === "CAPTURED_AFTER_FAILURE").length;
+    const successRate = totalPayments > 0 ? captured / totalPayments : 0;
+    const underReview = rows.filter((r) => r.status === "PENDING_REVIEW").length;
+    const statusDistribution: Record<string, number> = {};
+    for (const r of rows) {
+      statusDistribution[r.status] = (statusDistribution[r.status] ?? 0) + 1;
+    }
+    return {
+      ok: true,
+      data: { totalPayments, totalVolume, successRate, underReview, statusDistribution },
+    };
+  } catch (err) {
+    return requestError(err);
+  }
+}
+
+// ── Situations ─────────────────────────────────────────────────────
+
+export interface SituationRow {
+  id: string;
+  kind: string;
+  severity: string;
+  description: string | null;
+  resolved: boolean;
+  created_at: string;
+  payment_id: string | null;
+}
+
+/** Fetch situations for a tenant. */
+export async function fetchSituations(
+  tenantId: string,
+  opts: { limit?: number; resolved?: boolean } = {},
+): Promise<SupabaseResult<SituationRow[]>> {
+  if (!supabase) return configError();
+  try {
+    let query = supabase
+      .from("situations")
+      .select("id, kind, severity, description, resolved, created_at, payment_id")
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: false });
+    if (opts.resolved !== undefined) query = query.eq("resolved", opts.resolved);
+    if (opts.limit) query = query.limit(opts.limit);
+    const { data, error } = await query;
+    if (error) return { ok: false, reason: "request", error: error.message };
+    return { ok: true, data: (data ?? []) as unknown as SituationRow[] };
+  } catch (err) {
+    return requestError(err);
+  }
+}
+
+// ── User roles (admin panel) ───────────────────────────────────────
+
+export interface UserRoleRow {
+  user_id: string;
+  role: string;
+  full_name: string | null;
+  email: string | null;
+  created_at: string;
+}
+
+/** Fetch user roles for a tenant (admin+). */
+export async function fetchUserRoles(
+  tenantId: string,
+): Promise<SupabaseResult<UserRoleRow[]>> {
+  if (!supabase) return configError();
+  try {
+    const { data, error } = await supabase
+      .from("user_roles")
+      .select("user_id, role, created_at")
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: true });
+    if (error) return { ok: false, reason: "request", error: error.message };
+    // Enrich with profile data
+    const rows = (data ?? []) as { user_id: string; role: string; created_at: string }[];
+    const enriched: UserRoleRow[] = [];
+    for (const row of rows) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("full_name")
+        .eq("id", row.user_id)
+        .single();
+      enriched.push({
+        ...row,
+        full_name: profile?.full_name ?? null,
+        email: null, // email is in auth.users, not accessible via RLS
+      });
+    }
+    return { ok: true, data: enriched };
+  } catch (err) {
+    return requestError(err);
+  }
+}
+
+// ── Payment detail (single payment + events) ───────────────────────
+
+/** Fetch a single payment by ID (viewer+). */
+export async function fetchPaymentById(
+  paymentId: string,
+): Promise<SupabaseResult<PaymentRow | null>> {
+  if (!supabase) return configError();
+  try {
+    const { data, error } = await supabase
+      .from("payments")
+      .select("id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at")
+      .eq("id", paymentId)
+      .single();
+    if (error) return { ok: false, reason: "request", error: error.message };
+    return { ok: true, data: data as unknown as PaymentRow };
+  } catch (err) {
+    return requestError(err);
+  }
+}
+
+// ── Policies ───────────────────────────────────────────────────────
+
+export interface PolicyRow {
+  id: string;
+  name: string;
+  description: string | null;
+  rule: Record<string, unknown>;
+  enabled: boolean;
+  created_at: string;
+}
+
+/** Fetch policies for a tenant. */
+export async function fetchPolicies(
+  tenantId: string,
+): Promise<SupabaseResult<PolicyRow[]>> {
+  if (!supabase) return configError();
+  try {
+    const { data, error } = await supabase
+      .from("policies")
+      .select("id, name, description, rule, enabled, created_at")
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: true });
+    if (error) return { ok: false, reason: "request", error: error.message };
+    return { ok: true, data: (data ?? []) as unknown as PolicyRow[] };
+  } catch (err) {
+    return requestError(err);
+  }
+}

@@ -69,7 +69,7 @@ export default function Settings() {
   const { user } = useAuth();
   const [name, setName] = useState(user?.name ?? "");
   const [email, setEmail] = useState(user?.email ?? "");
-  const [company, setCompany] = useState("Meridian Payments Inc.");
+  const [company, setCompany] = useState("PayRaksha Inc.");
   const [currency, setCurrency] = useState("USD");
   const [timezone, setTimezone] = useState("America/New_York");
   const [notifications, setNotifications] = useState(() =>
@@ -284,7 +284,7 @@ export default function Settings() {
             <CardHeader>
               <CardTitle className="text-base">Notifications</CardTitle>
               <CardDescription className="mt-1">
-                Choose what Meridian sends you.
+                Choose what PayRaksha sends you.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-1">
@@ -425,10 +425,9 @@ export default function Settings() {
                   </div>
                   {checkState === "no-session" && (
                     <p className="rounded-lg border border-border/70 bg-background/40 px-3 py-2.5 text-xs text-muted-foreground">
-                      Signed in, but not with a Supabase session yet — the app
-                      still authenticates through Convex. After the PayRaksha
-                      auth migration and a Supabase sign-in, this panel will
-                      resolve your tenant and role server-side.
+                      Signed in via Supabase Auth, but no tenant membership found.
+                      Ensure the user was created through Supabase Authentication and
+                      assigned a role in the demo tenant.
                     </p>
                   )}
                   {checkState === "error" && dbError && (

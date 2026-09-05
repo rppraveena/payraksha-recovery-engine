@@ -430,10 +430,10 @@ export default function Landing() {
             </span>
             <span className="leading-tight">
               <span className="block text-sm font-semibold tracking-tight">
-                Meridian
+                PayRaksha
               </span>
               <span className="block text-[11px] text-muted-foreground">
-                Design system
+                Payment Intelligence
               </span>
             </span>
           </Link>
@@ -562,8 +562,7 @@ export default function Landing() {
               />
               <div className="relative">
                 <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-                  Your product is already running on{" "}
-                  <span className="text-primary">Modern</span>
+                  Your product is already running on{" "}                    <span className="text-primary">PayRaksha</span>
                 </h2>
                 <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-muted-foreground">
                   Every color, typeface, spacing, radius and shadow ships as a
@@ -590,9 +589,8 @@ export default function Landing() {
       {/* Footer */}
       <footer className="border-t border-border/70">
         <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 py-6 text-xs text-muted-foreground sm:flex-row sm:px-6">
-          <p>© 2026 Meridian — payments &amp; risk operations.</p>
-          <p className="font-mono">
-            tokens: color · type · space · radius · shadow
+          <p>                  © 2026 PayRaksha — Payment State & Recovery Intelligence.</p>
+          <p className="font-mono">                    PayRaksha · Payment Intelligence
           </p>
         </div>
       </footer>

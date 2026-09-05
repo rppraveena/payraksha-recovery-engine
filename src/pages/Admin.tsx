@@ -39,11 +39,11 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 const TEAM = [
-  { name: "Maya Chen", email: "maya@meridian.io", role: "admin", status: "Active", lastActive: "2 min ago" },
-  { name: "Jonas Weber", email: "jonas@meridian.io", role: "analyst", status: "Active", lastActive: "18 min ago" },
-  { name: "Priya Nair", email: "priya@meridian.io", role: "analyst", status: "Active", lastActive: "1 hr ago" },
-  { name: "Sam Okafor", email: "sam@meridian.io", role: "support", status: "Active", lastActive: "3 hrs ago" },
-  { name: "Lena Fischer", email: "lena@meridian.io", role: "member", status: "Invited", lastActive: "—" },
+  { name: "Maya Chen", email: "maya@payraksha.io", role: "admin", status: "Active", lastActive: "2 min ago" },
+  { name: "Jonas Weber", email: "jonas@payraksha.io", role: "analyst", status: "Active", lastActive: "18 min ago" },
+  { name: "Priya Nair", email: "priya@payraksha.io", role: "analyst", status: "Active", lastActive: "1 hr ago" },
+  { name: "Sam Okafor", email: "sam@payraksha.io", role: "support", status: "Active", lastActive: "3 hrs ago" },
+  { name: "Lena Fischer", email: "lena@payraksha.io", role: "member", status: "Invited", lastActive: "—" },
 ];
 
 const FLAGS = [
