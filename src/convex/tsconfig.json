@@ -20,6 +20,7 @@
     "isolatedModules": true,
     "noEmit": true
   },
-  "include": ["./**/*"],
-  "exclude": ["./_generated"]
+    "include": ["src", "vly-toolbar-readonly.tsx"],
+  "exclude": ["src/convex"]
+
 }
