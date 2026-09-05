@@ -1,278 +1,521 @@
--- ============================================================================
--- PayRaksha demo seed
--- Idempotent: skips entirely if the demo tenant already exists.
+-- =============================================================================
+-- PayRaksha — Payment State & Recovery Intelligence
+-- 0002_demo_seed.sql
 --
--- Seeds:
---   * demo tenant + starter policies
---   * 500 payment histories (PAY-001 .. PAY-500) built from REAL payment_events
---     across 8 scenarios incl. duplicate webhooks and out-of-order arrivals
---   * payments.status DERIVED by folding the event history through the
---     state_transition_contract (never hardcoded)
---   * situations, recovery_actions, audit_events, recovery_rate_stats
+-- Seeds the demo tenant with 500 payment histories (PAY-001..PAY-500). Every
+-- history is a sequence of REAL payment_events rows folded through the
+-- state_transition_contract — the same validation the ingest function applies.
+-- Nothing here writes payments.status directly as a shortcut; status is the
+-- deterministic fold of the stored events, computed and written in the same
+-- pass (as the server-side ingest does for live events).
 --
--- The org admin account is NOT created here — it is provisioned through
--- Supabase Auth (see RUNBOOK). handle_new_profile() grants every new auth
--- user a viewer role in this tenant automatically.
--- ============================================================================
+-- Showcases included:
+--   PAY-001  duplicate webhook  — 5 stored events; the retransmitted
+--            payment.failed (same provider_event_id evt_1_3) is absorbed by
+--            UNIQUE(tenant_id, provider_event_id) and surfaced in audit.
+--   PAY-002  failed -> recovery.initiated -> captured (multi-event recovery)
+--   PAY-003  out-of-order guardrail — a late payment.expired after CAPTURED is
+--            stored but rejected by the contract (state_transitions valid=false
+--            + open situation); payments.status is NOT overwritten.
+--
+-- Idempotent: if the demo tenant already has payments, the seed skips itself.
+-- =============================================================================
 
 do $$
 declare
-  v_tenant uuid;
-  v_payment uuid;
-  v_scenario text;
-  v_state public.payment_state;
-  v_next public.payment_state;
-  v_seq int;
-  v_amount numeric(14,2);
-  v_currency char(3);
-  v_method text;
-  v_bank text;
-  v_psp text;
-  v_base timestamptz;
-  v_situation uuid;
-  i int;
-  r record;
+    v_tenant       uuid;
+    v_existing     bigint;
+
+    -- shared payment fields
+    v_ref          text;
+    v_amount       numeric(14, 2);
+    v_currency     text;
+    v_method       text;
+    v_bank         text;
+    v_psp          text;
+    v_t0           timestamptz;
+    v_ts           timestamptz;
+
+    -- generator state
+    i              int;
+    j              int;
+    v_mod          int;
+    v_init         text;
+    v_status       text;
+    v_to           text;
+    v_events       text[];
+    v_evt          text;
+    v_payment_id   uuid;
+    v_event_id     uuid;
+    v_evt_seq      int;
+
+    -- timestamps captured mid-walk for situations / actions
+    v_failed_at    timestamptz;
+    v_blocked_at   timestamptz;
+    v_esc_at       timestamptz;
+    v_queue_at     timestamptz;
+    v_rejected_at  timestamptz;
+    v_captured_at  timestamptz;
+    v_sit_id       uuid;
+
+    v_currencies   text[] := array['USD', 'EUR', 'GBP', 'INR', 'SGD'];
+    v_methods      text[] := array['card', 'bank_transfer', 'wallet', 'upi'];
+    v_banks        text[] := array['Chase', 'Barclays', 'HDFC', 'DBS', 'BNP Paribas'];
+    v_psps         text[] := array['Stripe', 'Adyen', 'Razorpay', 'Checkout.com', 'Worldpay'];
 begin
-  -- Skip if already seeded -------------------------------------------------
-  if exists (select 1 from public.tenants where slug = 'demo') then
-    raise notice 'demo tenant already seeded — skipping';
-    return;
-  end if;
+    -- Idempotence guard ------------------------------------------------------
+    select id into v_tenant from public.tenants where slug = 'demo';
+    if v_tenant is null then
+        insert into public.tenants (slug, name)
+        values ('demo', 'Demo Tenant')
+        returning id into v_tenant;
+    end if;
+    select count(*) into v_existing from public.payments where tenant_id = v_tenant;
+    if v_existing > 0 then
+        raise notice 'Demo seed already present (% payments for tenant %) — skipping.', v_existing, v_tenant;
+        return;
+    end if;
 
-  insert into public.tenants (name, slug)
-  values ('PayRaksha Demo', 'demo')
-  returning id into v_tenant;
-
-  -- Starter policies --------------------------------------------------------
-  insert into public.policies (tenant_id, name, description, condition, effect) values
-    (v_tenant, 'standard_retry',
-     'Auto-retry failed payments up to the configured limit.',
-     '{"max_retries": 3, "window_hours": 24}', 'allow'),
-    (v_tenant, 'high_value_manual_review',
-     'Recovery above the threshold requires operator approval.',
-     '{"amount_gte": 100000}', 'require_approval'),
-    (v_tenant, 'duplicate_webhook_reject',
-     'Never act on duplicate provider events.',
-     '{"event_kind": "duplicate"}', 'deny'),
-    (v_tenant, 'late_capture_auto_review',
-     'Captures arriving after a failure are queued for review.',
-     '{"situation": "late_capture_after_failure"}', 'require_approval')
-  on conflict (tenant_id, name) do nothing;
-
-  -- 500 payment histories ----------------------------------------------------
-  for i in 1..500 loop
-    v_scenario := case
-      when i = 1 then 'duplicate_webhook'        -- showcase payment
-      when i % 100 = 2 then 'duplicate_webhook'  -- 4 more
-      when i % 50 = 3 then 'out_of_order'        -- ~10
-      when i % 37 = 5 then 'late_capture'        -- ~13
-      when i % 11 = 6 then 'card_expired'        -- ~45
-      when i % 9 = 7 then 'insufficient_balance' -- ~55
-      when i % 17 = 8 then 'review_queue'        -- ~29
-      when i % 7 = 0 then 'happy_path'           -- remainder share
-      else 'recovery_flow'
-    end;
-
-    v_amount    := 250 + ((i * 7919) % 199500);           -- 250 .. 199,750
-    v_currency  := case when i % 23 = 0 then 'USD' else 'INR' end;
-    v_method    := (array['card','upi','netbanking'])[1 + (i % 3)];
-    v_bank      := (array['HDFC','ICICI','SBI','Axis'])[1 + (i % 4)];
-    v_psp       := (array['razorpay','payu','cashfree'])[1 + (i % 3)];
-    v_base      := now() - ((500 - i) || ' hours')::interval;
+    ---------------------------------------------------------------------------
+    -- PAY-001 — duplicate webhook showcase. Stored events:
+    -- created -> authorized -> failed -> recovery.initiated -> captured
+    -- (5 rows). The retransmitted payment.failed (evt_1_3) is absorbed.
+    ---------------------------------------------------------------------------
+    v_ref := 'PAY-001';
+    v_amount := 1240.00;
+    v_currency := 'USD';
+    v_method := 'card';
+    v_bank := 'Chase';
+    v_psp := 'Stripe';
+    v_t0 := now() - interval '88 days 4 hours';
+    v_status := 'FAILED'; -- implicit pre-history state
 
     insert into public.payments (tenant_id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at)
-    values (v_tenant, 'PAY-' || lpad(i::text, 3, '0'), v_amount, v_currency, v_method, v_bank, v_psp, 'FAILED', v_base, v_base)
-    returning id into v_payment;
+    values (v_tenant, v_ref, v_amount, v_currency, v_method, v_bank, v_psp, v_status, v_t0, v_t0)
+    returning id into v_payment_id;
 
-    -- Raw event history per scenario (occurred_at ordering is authoritative).
-    if v_scenario = 'happy_path' then
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',   v_base,                  '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized',v_base + interval '2 min', '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.captured',  v_base + interval '5 min', '{"source":"seed"}');
-      v_seq := 3;
+    for j in 1..5 loop
+        v_evt := (array['payment.created', 'payment.authorized', 'payment.failed',
+                        'recovery.initiated', 'payment.captured'])[j];
+        v_ts := v_t0 + ((j - 1) || ' minutes')::interval + (j || ' seconds')::interval;
+        select to_state into v_to
+          from public.state_transition_contract
+         where event_type = v_evt and from_state = v_status;
+        if v_to is null then
+            raise exception 'PAY-001 generator violates contract: % from %', v_evt, v_status;
+        end if;
 
-    elsif v_scenario = 'recovery_flow' then
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                    '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '2 min', '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '6 min', '{"error_code":"insufficient_funds","source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_4', 'recovery.initiated', v_base + interval '30 min','{"source":"seed"}');
-      v_seq := 4;
-      if i % 5 <> 0 then  -- ~80% eventually recover
-        insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-          (v_tenant, v_payment, 'evt_' || i || '_5', 'payment.captured', v_base + interval '2 hours', '{"source":"seed","recovered":true}');
-        v_seq := 5;
-      end if;
+        insert into public.payment_events
+            (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+        values
+            (gen_random_uuid(), v_tenant, v_payment_id,
+             'evt_1_' || j, v_evt, v_ts,
+             jsonb_build_object('payment_ref', v_ref, 'amount', v_amount,
+                                'currency', v_currency, 'method', v_method,
+                                'psp', v_psp, 'sequence', j,
+                                'error_code', case when v_evt = 'payment.failed' then 'issuer_decline' end,
+                                'error_description', case when v_evt = 'payment.failed' then 'Card declined by issuer on retry attempt' end))
+        returning id into v_event_id;
 
-    elsif v_scenario = 'card_expired' then
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',   v_base,                     '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized',v_base + interval '1 min',  '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.expired',   v_base + interval '40 min', '{"error_code":"card_expired","source":"seed"}');
-      v_seq := 3;
+        insert into public.state_transitions
+            (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+        values (v_tenant, v_payment_id, v_event_id, v_status, v_to, true, v_evt, v_ts);
 
-    elsif v_scenario = 'insufficient_balance' then
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                     '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '1 min',  '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '3 min',  '{"error_code":"insufficient_balance","source":"seed"}');
-      v_seq := 3;
-
-    elsif v_scenario = 'duplicate_webhook' then
-      -- Retransmitted webhook: the second insert carries the SAME
-      -- provider_event_id and is absorbed by UNIQUE(tenant_id,
-      -- provider_event_id). The raw payload records the duplicate attempt.
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                     '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '2 min',  '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '7 min',  '{"error_code":"gateway_timeout","source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_4', 'recovery.initiated', v_base + interval '25 min', '{"source":"seed"}');
-      -- Duplicate delivery of evt_..._3: silently absorbed by the unique key.
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw)
-      values (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed', v_base + interval '7 min',
-              '{"error_code":"gateway_timeout","source":"seed","duplicate":true,"duplicate_of":"evt_' || i || '_3"}')
-      on conflict (tenant_id, provider_event_id) do nothing;
-      -- PAY-001 showcase: also demonstrate the late capture that arrives after
-      -- the failure and finishes the recovery (CAPTURED_AFTER_FAILURE).
-      if i = 1 then
-        insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-          (v_tenant, v_payment, 'evt_1_5', 'payment.captured', v_base + interval '50 min',
-           '{"source":"seed","late":true,"recovered":true}');
-        v_seq := 5;
-      else
-        v_seq := 4;
-      end if;
-
-    elsif v_scenario = 'out_of_order' then
-      -- Webhook ARRIVAL order differs from occurred_at; raw preserves arrival.
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.authorized', v_base + interval '3 min', '{"source":"seed","arrival_seq":2,"note":"arrived before created"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.created',    v_base,                    '{"source":"seed","arrival_seq":1}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.captured',   v_base + interval '9 min', '{"source":"seed","arrival_seq":3}');
-      v_seq := 3;
-
-    elsif v_scenario = 'late_capture' then
-      -- Capture lands AFTER a failure: CAPTURED_AFTER_FAILURE story.
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                      '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '2 min',   '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '8 min',   '{"error_code":"timeout","source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_4', 'payment.captured',   v_base + interval '50 min',  '{"source":"seed","late":true}');
-      v_seq := 4;
-
-    else -- review_queue
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',  v_base,                     '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.failed',   v_base + interval '2 min',  '{"error_code":"risk_hold","source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'review.queued',    v_base + interval '10 min', '{"source":"seed"}');
-      v_seq := 3;
-    end if;
-
-    -- ------------------------------------------------------------------
-    -- State reconstruction: fold the event history through the explicit
-    -- transition contract, ordered by occurred_at. Every step is recorded
-    -- in state_transitions; payments.status is DERIVED, never hardcoded.
-    -- ------------------------------------------------------------------
-    v_state := 'FAILED';
-    for r in
-      select e.id as event_id, e.event_type
-      from public.payment_events e
-      where e.payment_id = v_payment
-      order by e.occurred_at, e.created_at
-    loop
-      v_next := null;
-      select c.to_state into v_next
-      from public.state_transition_contract c
-      where c.event_type = r.event_type and c.from_state = v_state;
-
-      insert into public.state_transitions (tenant_id, payment_id, event_id, from_state, to_state, applied, rejection_reason)
-      values (v_tenant, v_payment, r.event_id, v_state, coalesce(v_next, v_state), v_next is not null,
-              case when v_next is null then format('%s not allowed from %s', r.event_type, v_state) end);
-
-      if v_next is not null and v_next <> v_state then
-        v_state := v_next;
-      end if;
+        if v_evt = 'payment.failed' then v_failed_at := v_ts; end if;
+        if v_evt = 'payment.captured' then v_captured_at := v_ts; end if;
+        v_status := v_to;
     end loop;
 
-    update public.payments
-       set status = v_state, updated_at = v_base + (v_seq || ' minutes')::interval
-     where id = v_payment;
+    -- The duplicate delivery: same provider_event_id as stored event #3.
+    v_ts := v_t0 + interval '3 minutes 30 seconds';
+    insert into public.payment_events
+        (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+    values
+        (v_tenant, v_payment_id, 'evt_1_3', 'payment.failed', v_ts,
+         jsonb_build_object('payment_ref', v_ref, 'duplicate', true, 'error_code', 'issuer_decline'))
+    on conflict (tenant_id, provider_event_id) do nothing;
 
-    -- Situations + proposed recovery actions for non-healthy stories ------
-    if v_scenario in ('duplicate_webhook', 'late_capture', 'card_expired', 'insufficient_balance') then
-      insert into public.situations (tenant_id, payment_id, kind, severity, diagnosis, detected_at, resolved_at)
-      values (
-        v_tenant, v_payment,
-        case v_scenario
-          when 'duplicate_webhook' then 'duplicate_webhook'
-          when 'late_capture' then 'late_capture_after_failure'
-          when 'card_expired' then 'expired_card'
-          else 'insufficient_balance'
-        end,
-        case when v_scenario in ('late_capture', 'duplicate_webhook') then 'critical' else 'warning' end,
-        case v_scenario
-          when 'duplicate_webhook' then 'Duplicate provider webhook absorbed by dedup key; recovery initiated.'
-          when 'late_capture' then 'Capture confirmed after a failure event — reconcile PSP settlement.'
-          when 'card_expired' then 'Authorization expired; instrument needs refresh before retry.'
-          else 'Insufficient balance at first attempt; scheduled retry recommended.'
-        end,
-        v_base + (v_seq || ' minutes')::interval,
-        case when v_state in ('CAPTURED', 'CAPTURED_AFTER_FAILURE')
-             then v_base + interval '3 hours' end
-      )
-      returning id into v_situation;
+    insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+    values (v_tenant, null, 'webhook.duplicate_suppressed', 'payment_events', v_payment_id::text,
+            jsonb_build_object('provider_event_id', 'evt_1_3', 'event_type', 'payment.failed', 'payment_ref', v_ref),
+            v_ts);
 
-      if v_state not in ('CAPTURED', 'CAPTURED_AFTER_FAILURE') then
-        insert into public.recovery_actions (tenant_id, payment_id, situation_id, action, expected_value, status, created_at)
-        values (
-          v_tenant, v_payment, v_situation,
-          case v_scenario
-            when 'card_expired' then 'request_instrument_refresh'
-            when 'insufficient_balance' then 'scheduled_retry'
-            else 'manual_review'
-          end,
-          round(v_amount * 0.92, 2),
-          'proposed',
-          v_base + (v_seq || ' minutes')::interval
-        );
-      end if;
-    end if;
+    insert into public.situations
+        (tenant_id, payment_id, kind, severity, status, summary, detected_at, resolved_at)
+    values (v_tenant, v_payment_id, 'duplicate_webhook', 'medium', 'resolved',
+            'Retransmitted payment.failed webhook (evt_1_3) absorbed by dedup contract; state unaffected.',
+            v_ts, v_ts + interval '1 minute');
 
-    -- Pipeline audit entry for the seed import -----------------------------
-    insert into public.audit_events (tenant_id, actor, action, entity_type, entity_id, payload, created_at)
-    values (v_tenant, null, 'seed.import', 'payment', v_payment,
-            jsonb_build_object('scenario', v_scenario, 'final_state', v_state, 'events', v_seq),
-            v_base + (v_seq || ' minutes')::interval);
-  end loop;
+    -- final status: CAPTURED_AFTER_FAILURE
+    update public.payments set status = v_status, updated_at = now() where id = v_payment_id;
+    insert into public.recovery_actions
+        (tenant_id, payment_id, action, status, value_recovered, executed_at, created_at)
+    values (v_tenant, v_payment_id, 'retry_capture', 'executed', v_amount, v_captured_at, v_captured_at);
+    insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+    values (v_tenant, null, 'payment.recovered', 'payments', v_payment_id::text,
+            jsonb_build_object('payment_ref', v_ref, 'status', 'CAPTURED_AFTER_FAILURE', 'amount', v_amount),
+            v_captured_at);
+    raise notice 'Seeded PAY-001 (duplicate webhook showcase) -> %', v_status;
 
-  -- Recovery rate stats: 30 daily buckets -----------------------------------
-  insert into public.recovery_rate_stats (tenant_id, bucket, attempts, recoveries, recovered_value)
-  select
-    v_tenant,
-    current_date - g,
-    18 + (g * 7) % 11,
-    6 + (g * 5) % 7,
-    (6 + (g * 5) % 7) * 2140.00
-  from generate_series(0, 29) as g
-  on conflict (tenant_id, bucket) do nothing;
+    ---------------------------------------------------------------------------
+    -- PAY-002 — failed -> recovery.initiated -> captured (multi-event recovery)
+    ---------------------------------------------------------------------------
+    v_ref := 'PAY-002';
+    v_amount := 820.50;
+    v_t0 := now() - interval '87 days 2 hours';
+    v_status := 'FAILED';
+    insert into public.payments (tenant_id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at)
+    values (v_tenant, v_ref, v_amount, 'EUR', 'card', 'Barclays', 'Adyen', v_status, v_t0, v_t0)
+    returning id into v_payment_id;
 
-  raise notice 'Seeded demo tenant %: 500 payments, events, situations, audit.', v_tenant;
+    for j in 1..4 loop
+        v_evt := (array['payment.created', 'payment.failed', 'recovery.initiated', 'payment.captured'])[j];
+        v_ts := v_t0 + ((j - 1) || ' minutes')::interval + (j || ' seconds')::interval;
+        select to_state into v_to
+          from public.state_transition_contract
+         where event_type = v_evt and from_state = v_status;
+        if v_to is null then
+            raise exception 'PAY-002 generator violates contract: % from %', v_evt, v_status;
+        end if;
+        insert into public.payment_events
+            (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+        values
+            (gen_random_uuid(), v_tenant, v_payment_id, 'evt_2_' || j, v_evt, v_ts,
+             jsonb_build_object('payment_ref', v_ref, 'amount', v_amount, 'sequence', j,
+                                'error_code', case when v_evt = 'payment.failed' then 'do_not_honor' end))
+        returning id into v_event_id;
+        insert into public.state_transitions
+            (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+        values (v_tenant, v_payment_id, v_event_id, v_status, v_to, true, v_evt, v_ts);
+        if v_evt = 'payment.failed' then v_failed_at := v_ts; end if;
+        if v_evt = 'payment.captured' then v_captured_at := v_ts; end if;
+        v_status := v_to;
+    end loop;
+    update public.payments set status = v_status, updated_at = now() where id = v_payment_id;
+    insert into public.recovery_actions
+        (tenant_id, payment_id, action, status, value_recovered, executed_at, created_at)
+    values (v_tenant, v_payment_id, 'retry_capture', 'executed', v_amount, v_captured_at, v_captured_at);
+    insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+    values (v_tenant, null, 'payment.recovered', 'payments', v_payment_id::text,
+            jsonb_build_object('payment_ref', v_ref, 'status', 'CAPTURED_AFTER_FAILURE', 'amount', v_amount),
+            v_captured_at);
+
+    ---------------------------------------------------------------------------
+    -- PAY-003 — out-of-order guardrail: late payment.expired after CAPTURED.
+    ---------------------------------------------------------------------------
+    v_ref := 'PAY-003';
+    v_amount := 199.99;
+    v_t0 := now() - interval '86 days 5 hours';
+    v_status := 'FAILED';
+    insert into public.payments (tenant_id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at)
+    values (v_tenant, v_ref, v_amount, 'GBP', 'card', 'DBS', 'Checkout.com', v_status, v_t0, v_t0)
+    returning id into v_payment_id;
+
+    for j in 1..2 loop
+        v_evt := (array['payment.authorized', 'payment.captured'])[j];
+        v_ts := v_t0 + ((j - 1) || ' minutes')::interval;
+        select to_state into v_to
+          from public.state_transition_contract
+         where event_type = v_evt and from_state = v_status;
+        if v_to is null then
+            raise exception 'PAY-003 generator violates contract: % from %', v_evt, v_status;
+        end if;
+        insert into public.payment_events
+            (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+        values (gen_random_uuid(), v_tenant, v_payment_id, 'evt_3_' || j, v_evt, v_ts,
+                jsonb_build_object('payment_ref', v_ref, 'amount', v_amount, 'sequence', j))
+        returning id into v_event_id;
+        insert into public.state_transitions
+            (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+        values (v_tenant, v_payment_id, v_event_id, v_status, v_to, true, v_evt, v_ts);
+        if v_evt = 'payment.captured' then v_captured_at := v_ts; end if;
+        v_status := v_to;
+    end loop;
+    update public.payments set status = v_status, updated_at = now() where id = v_payment_id;
+
+    -- Guardrail attempt: expired arrives AFTER capture. Stored (raw truth) but
+    -- rejected by the contract; status stays CAPTURED.
+    v_ts := v_captured_at + interval '90 minutes';
+    insert into public.payment_events
+        (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+    values (gen_random_uuid(), v_tenant, v_payment_id, 'evt_3_3', 'payment.expired', v_ts,
+            jsonb_build_object('payment_ref', v_ref, 'out_of_order', true))
+    returning id into v_event_id;
+    insert into public.state_transitions
+        (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+    values (v_tenant, v_payment_id, v_event_id, v_status, v_status, false,
+            'Invalid transition: payment.expired not allowed from CAPTURED', v_ts);
+    insert into public.situations
+        (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+    values (v_tenant, v_payment_id, 'out_of_order_event', 'high', 'open',
+            'Late payment.expired webhook arrived after CAPTURED — stored for audit, rejected by the state contract.',
+            v_ts);
+    insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+    values (v_tenant, null, 'state.conflict_rejected', 'payments', v_payment_id::text,
+            jsonb_build_object('payment_ref', v_ref, 'event_type', 'payment.expired', 'from_state', 'CAPTURED'),
+            v_ts);
+
+    ---------------------------------------------------------------------------
+    -- PAY-004 .. PAY-500 — deterministic mix of real event histories.
+    ---------------------------------------------------------------------------
+    for i in 4..500 loop
+        v_mod := (i - 4) % 10;
+        v_ref := 'PAY-' || lpad(i::text, 3, '0');
+        v_amount := (((i * 37) % 4800) + 25 + ((i % 7)::numeric / 100.0))::numeric(14, 2);
+        v_currency := v_currencies[1 + (i % 5)];
+        v_method   := v_methods[1 + (i % 4)];
+        v_bank     := v_banks[1 + (i % 5)];
+        v_psp      := v_psps[1 + (i % 5)];
+        v_t0 := now() - ((1 + ((i * 7) % 85)) || ' days')::interval
+                     - (((i * 13) % 1400) || ' minutes')::interval;
+
+        v_init := 'FAILED';
+        if    v_mod in (0, 1, 8) then
+            -- normal captures (0: authorized+captured, 1/8: created first)
+            if v_mod = 0 then
+                v_events := array['payment.authorized', 'payment.captured'];
+            else
+                v_events := array['payment.created', 'payment.authorized', 'payment.captured'];
+            end if;
+        elsif v_mod in (2, 9) then
+            -- decline -> recovery.initiated -> captured (recovered)
+            v_events := array['payment.created', 'payment.authorized', 'payment.failed',
+                              'recovery.initiated', 'payment.captured'];
+        elsif v_mod = 3 then
+            -- decline -> recovery -> risk block (terminal-ish, releasable)
+            v_events := array['payment.created', 'payment.authorized', 'payment.failed',
+                              'recovery.initiated', 'system.blocked'];
+        elsif v_mod = 4 then
+            -- decline -> escalation
+            v_events := array['payment.created', 'payment.authorized', 'payment.failed',
+                              'system.escalated'];
+        elsif v_mod = 5 then
+            -- auth -> expired -> recovery -> captured after failure
+            v_events := array['payment.created', 'payment.authorized', 'payment.expired',
+                              'recovery.initiated', 'payment.captured'];
+        elsif v_mod = 6 then
+            -- recovery cancelled by operator
+            v_events := array['payment.created', 'payment.authorized', 'payment.failed',
+                              'recovery.cancelled'];
+        else -- v_mod = 7
+            -- declined -> review -> rejected (final FAILED)
+            v_events := array['payment.created', 'payment.authorized', 'payment.failed',
+                              'review.queued', 'review.rejected'];
+        end if;
+
+        v_status := v_init;
+        v_failed_at := null; v_blocked_at := null; v_esc_at := null;
+        v_queue_at := null; v_rejected_at := null; v_captured_at := null;
+
+        -- Mid-flight cuts so AUTHORIZED, PENDING_REVIEW and RECOVERY_PENDING
+        -- also appear as CURRENT states, not just waypoints.
+        if v_mod = 0 and (i % 23) = 0 then
+            v_events := v_events[1 : array_length(v_events, 1) - 1]; -- authorized only
+        elsif v_mod = 1 and (i % 29) = 0 then
+            v_events := v_events[1 : 1]; -- created only
+        elsif v_mod = 2 and (i % 31) = 0 then
+            v_events := v_events[1 : 3]; -- created, authorized, failed
+        end if;
+
+        insert into public.payments
+            (tenant_id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at)
+        values (v_tenant, v_ref, v_amount, v_currency, v_method, v_bank, v_psp, v_status, v_t0, v_t0)
+        returning id into v_payment_id;
+
+        j := 1;
+        foreach v_evt in array v_events loop
+            v_ts := v_t0 + (((j - 1) * 7 + (i * 3) % 40) || ' minutes')::interval
+                         + (j || ' seconds')::interval;
+            -- late-capture flavor: authorize then capture ~26h later
+            if j = 3 and v_mod = 8 and (i % 17) = 0 and v_evt = 'payment.captured' then
+                v_ts := v_t0 + interval '26 hours';
+            end if;
+            select to_state into v_to
+              from public.state_transition_contract
+             where event_type = v_evt and from_state = v_status;
+            if v_to is null then
+                raise exception 'Seed generator violates contract for %: % from %', v_ref, v_evt, v_status;
+            end if;
+
+            insert into public.payment_events
+                (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+            values (gen_random_uuid(), v_tenant, v_payment_id,
+                    'evt_' || i || '_' || j, v_evt, v_ts,
+                    jsonb_build_object('payment_ref', v_ref, 'amount', v_amount,
+                                       'currency', v_currency, 'method', v_method,
+                                       'bank', v_bank, 'psp', v_psp, 'sequence', j,
+                                       'error_code', case when v_evt = 'payment.failed' and v_mod = 7
+                                                            then (array['card_expired', 'insufficient_funds', 'generic_decline'])[1 + (i % 3)]
+                                                           when v_evt = 'payment.failed' then 'issuer_decline'
+                                                           when v_evt = 'payment.expired' then 'auth_window_lapsed'
+                                                      end,
+                                       'error_description', case when v_evt = 'payment.failed' and v_mod = 7 and (i % 3) = 0
+                                                                  then 'Card expired — retry rejected by issuer'
+                                                                  when v_evt = 'payment.failed' and v_mod = 7 and (i % 3) = 1
+                                                                  then 'Insufficient balance at capture time'
+                                                                  else null end))
+            returning id into v_event_id;
+
+            insert into public.state_transitions
+                (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+            values (v_tenant, v_payment_id, v_event_id, v_status, v_to, true, v_evt, v_ts);
+
+            if v_evt = 'payment.failed' then v_failed_at := coalesce(v_failed_at, v_ts); end if;
+            if v_evt = 'system.blocked' then v_blocked_at := v_ts; end if;
+            if v_evt = 'system.escalated' then v_esc_at := v_ts; end if;
+            if v_evt = 'review.queued' then v_queue_at := v_ts; end if;
+            if v_evt = 'review.rejected' then v_rejected_at := v_ts; end if;
+            if v_evt = 'payment.captured' then v_captured_at := v_ts; end if;
+
+            v_status := v_to;
+            j := j + 1;
+        end loop;
+
+        -- Write the deterministic final state (equivalent of the ingest fold).
+        update public.payments set status = v_status, updated_at = now() where id = v_payment_id;
+
+        -- Situations / recovery actions / audit by outcome -------------------
+        if v_status = 'CAPTURED_AFTER_FAILURE' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at, resolved_at)
+            values (v_tenant, v_payment_id, 'recovery_pending', 'medium', 'resolved',
+                    'Capture failed then recovery retry succeeded.',
+                    v_failed_at, v_captured_at)
+            returning id into v_sit_id;
+            insert into public.recovery_actions
+                (tenant_id, payment_id, situation_id, action, status, value_recovered, executed_at, created_at)
+            values (v_tenant, v_payment_id, v_sit_id, 'retry_capture', 'executed', v_amount, v_captured_at, v_captured_at);
+            insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+            values (v_tenant, null, 'payment.recovered', 'payments', v_payment_id::text,
+                    jsonb_build_object('payment_ref', v_ref, 'status', 'CAPTURED_AFTER_FAILURE', 'amount', v_amount),
+                    v_captured_at);
+        elsif v_status = 'RECOVERY_PENDING' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+            values (v_tenant, v_payment_id, 'recovery_pending', 'medium', 'open',
+                    'Capture failed — recovery retry queued and awaiting execution.',
+                    v_failed_at);
+            insert into public.recovery_actions
+                (tenant_id, payment_id, action, status, value_recovered, executed_at, created_at)
+            values (v_tenant, v_payment_id, 'retry_capture', 'pending', 0, null, now());
+        elsif v_status = 'BLOCKED' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+            values (v_tenant, v_payment_id, 'payment_blocked', 'critical', 'open',
+                    'Risk rule blocked recovery path — requires release or manual review.',
+                    v_blocked_at);
+            insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+            values (v_tenant, null, 'payment.blocked', 'payments', v_payment_id::text,
+                    jsonb_build_object('payment_ref', v_ref), v_blocked_at);
+        elsif v_status = 'ESCALATED' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+            values (v_tenant, v_payment_id, 'escalated_payment', 'high', 'open',
+                    'Auto-recovery exhausted — escalated for specialist review.',
+                    v_esc_at);
+            insert into public.recovery_actions
+                (tenant_id, payment_id, action, status, value_recovered, executed_at, created_at)
+            values (v_tenant, v_payment_id, 'escalate', 'executed', 0, v_esc_at, v_esc_at);
+            insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+            values (v_tenant, null, 'payment.escalated', 'payments', v_payment_id::text,
+                    jsonb_build_object('payment_ref', v_ref), v_esc_at);
+        elsif v_status = 'RECOVERY_CANCELLED' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+            values (v_tenant, v_payment_id, 'recovery_pending', 'low', 'resolved',
+                    'Recovery cancelled by operator decision.', v_failed_at, now() - interval '1 hour');
+        elsif v_status = 'FAILED' then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at, resolved_at)
+            values (v_tenant, v_payment_id, 'review_required', 'high', 'resolved',
+                    'Declined payment reviewed and rejected — no recovery path.',
+                    v_queue_at, v_rejected_at);
+            if (i % 3) = 0 then
+                insert into public.situations
+                    (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+                values (v_tenant, v_payment_id, 'card_expired', 'medium', 'open',
+                        'Issuer reported an expired card on the decline.',
+                        v_failed_at);
+            elsif (i % 3) = 1 then
+                insert into public.situations
+                    (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+                values (v_tenant, v_payment_id, 'insufficient_balance', 'medium', 'open',
+                        'Issuer reported insufficient balance at capture time.',
+                        v_failed_at);
+            end if;
+        end if;
+
+        -- Guardrail showcase: late/terminal-state events on normal captures.
+        if v_status = 'CAPTURED' and (v_mod in (0, 1, 8)) and (i % 13) = 0 then
+            v_ts := v_captured_at + interval '2 hours';
+            v_evt := case when (i % 2) = 0 then 'payment.expired' else 'system.escalated' end;
+            insert into public.payment_events
+                (id, tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw_payload)
+            values (gen_random_uuid(), v_tenant, v_payment_id, 'evt_' || i || '_' || j, v_evt, v_ts,
+                    jsonb_build_object('payment_ref', v_ref, 'out_of_order', true))
+            returning id into v_event_id;
+            insert into public.state_transitions
+                (tenant_id, payment_id, payment_event_id, from_state, to_state, valid, reason, created_at)
+            values (v_tenant, v_payment_id, v_event_id, v_status, v_status, false,
+                    'Invalid transition: ' || v_evt || ' not allowed from CAPTURED', v_ts);
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at)
+            values (v_tenant, v_payment_id, 'out_of_order_event', 'high', 'open',
+                    'Out-of-order ' || v_evt || ' after CAPTURED — stored, rejected by contract.',
+                    v_ts);
+            insert into public.audit_events (tenant_id, actor_role, action, entity_type, entity_id, details, occurred_at)
+            values (v_tenant, null, 'state.conflict_rejected', 'payments', v_payment_id::text,
+                    jsonb_build_object('payment_ref', v_ref, 'event_type', v_evt, 'from_state', 'CAPTURED'),
+                    v_ts);
+        end if;
+
+        -- Late-capture flavor situation.
+        if v_mod = 8 and (i % 17) = 0 and v_captured_at is not null then
+            insert into public.situations
+                (tenant_id, payment_id, kind, severity, status, summary, detected_at, resolved_at)
+            values (v_tenant, v_payment_id, 'late_capture', 'info', 'resolved',
+                    'Authorized hold captured ~26h later than typical.',
+                    v_t0 + interval '1 hour', v_captured_at);
+        end if;
+    end loop;
+
+    ---------------------------------------------------------------------------
+    -- Recovery-rate stats (daily buckets from executed retry captures).
+    ---------------------------------------------------------------------------
+    insert into public.recovery_rate_stats
+        (tenant_id, bucket_date, attempted, recovered, recovered_amount, rate)
+    select
+        t.id,
+        date(ra.executed_at),
+        count(*)::int,
+        count(*) filter (where p.status in ('CAPTURED', 'CAPTURED_AFTER_FAILURE'))::int,
+        coalesce(sum(ra.value_recovered) filter (where p.status in ('CAPTURED', 'CAPTURED_AFTER_FAILURE')), 0),
+        case when count(*) > 0
+             then (count(*) filter (where p.status in ('CAPTURED', 'CAPTURED_AFTER_FAILURE')))::numeric / count(*)
+             else 0 end
+    from public.recovery_actions ra
+    join public.payments p   on p.id = ra.payment_id
+    cross join public.tenants t
+    where t.id = v_tenant
+      and ra.action = 'retry_capture'
+      and ra.executed_at is not null
+    group by t.id, date(ra.executed_at)
+    order by 2;
+
+    ---------------------------------------------------------------------------
+    -- Demo policies.
+    ---------------------------------------------------------------------------
+    insert into public.policies (tenant_id, name, description, enabled, conditions, action) values
+        (v_tenant, 'Auto-retry capture once', 'Retry capture once when a payment enters RECOVERY_PENDING with an issuer decline.',
+         true, jsonb_build_object('trigger', 'recovery.initiated', 'max_retries', 1, 'error_codes', jsonb_build_array('issuer_decline')), 'retry_capture'),
+        (v_tenant, 'Escalate after 3 recovery attempts', 'Escalate to specialist review when three recovery attempts fail.',
+         true, jsonb_build_object('trigger', 'recovery.failed', 'threshold', 3), 'escalate'),
+        (v_tenant, 'Block suspected fraud velocity', 'Block recovery when the same instrument fails more than 5 times in an hour.',
+         true, jsonb_build_object('trigger', 'payment.failed', 'window_minutes', 60, 'threshold', 5), 'system.blocked'),
+        (v_tenant, 'Card-expired auto review', 'Queue declined payments with card_expired for manual review instead of retry.',
+         true, jsonb_build_object('error_codes', jsonb_build_array('card_expired')), 'review.queued')
+    on conflict do nothing;
+
+    raise notice 'Demo seed complete: 500 payment histories for tenant %', v_tenant;
 end;
 $$;
-
--- ============================================================================
--- Verification queries (run in the SQL editor after seeding):
---
---   -- multiple events per payment (the PayRaksha story):
---   select payment_id, count(*) from payment_events group by 1 order by 1 limit 10;
---
---   -- the PAY-001 showcase (5 stored events — the retransmitted failed
---   -- webhook shares evt_1_3 and was absorbed by the unique key):
---   select p.payment_ref, e.provider_event_id, e.event_type, e.occurred_at
---   from payments p join payment_events e on e.payment_id = p.id
---   where p.payment_ref = 'PAY-001' order by e.occurred_at;
---
---   -- derived status distribution:
---   select status, count(*) from payments group by 1 order by 2 desc;
--- ============================================================================

@@ -19,37 +19,24 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/hooks/use-auth";
 import {
-  fetchAuditLog,
+  fetchAuditEvents,
+  hasSupabaseSession,
+  listMyTenants,
   supabaseConfig,
-  writeAuditLog,
-  type AuditRow,
+  type AuditEventRow,
+  type PayRakshaTenant,
 } from "@/lib/supabase";
 import {
   Copy,
   Database,
   KeyRound,
   Loader2,
-  PenLine,
   RefreshCw,
   Save,
   Trash2,
 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-
-const SETUP_SQL = `create table if not exists audit_log (
-  id bigint generated always as identity primary key,
-  created_at timestamptz not null default now(),
-  workspace text,
-  actor text not null,
-  event_type text not null,
-  payload jsonb
-);
-alter table audit_log enable row level security;
-create policy "anon can read audit_log" on audit_log
-  for select using (true);
-create policy "anon can insert audit_log" on audit_log
-  for insert with check (true);`;
 
 const NOTIFICATIONS = [
   {
@@ -88,41 +75,55 @@ export default function Settings() {
   const [notifications, setNotifications] = useState(() =>
     new Map(NOTIFICATIONS.map((n) => [n.id, n.defaultOn])),
   );
-  const [auditRows, setAuditRows] = useState<AuditRow[]>([]);
-  const [dbBusy, setDbBusy] = useState<"pull" | "write" | null>(null);
+  const [auditRows, setAuditRows] = useState<AuditEventRow[]>([]);
+  const [activeTenant, setActiveTenant] = useState<PayRakshaTenant | null>(null);
+  const [checkState, setCheckState] = useState<
+    "idle" | "checking" | "ok" | "no-session" | "error"
+  >("idle");
   const [dbError, setDbError] = useState<string | null>(null);
 
-  const loadAudit = async (quiet = false) => {
-    setDbBusy("pull");
+  const runDataSourceCheck = async () => {
+    setCheckState("checking");
     setDbError(null);
-    const result = await fetchAuditLog(8);
-    if (result.ok) {
-      setAuditRows(result.data);
-      if (!quiet) toast.success(`Loaded ${result.data.length} audit events.`);
-    } else {
-      setDbError(result.error);
-      if (!quiet) toast.error(result.error);
+    setAuditRows([]);
+    if (!supabaseConfig.configured) {
+      setCheckState("error");
+      setDbError(
+        "Supabase keys are not configured — add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (or VITE_SUPABASE_PUBLISHABLE_KEY) in the Keys tab.",
+      );
+      return;
     }
-    setDbBusy(null);
-  };
-
-  const recordProbe = async () => {
-    setDbBusy("write");
-    setDbError(null);
-    const result = await writeAuditLog({
-      workspace: company || "Meridian",
-      actor: user?.email ?? user?.name ?? "settings-user",
-      event_type: "settings.integration_probe",
-      payload: { source: "settings" },
-    });
-    if (result.ok) {
-      toast.success("Audit event written to Postgres.");
-      await loadAudit(true);
-    } else {
-      setDbError(result.error);
-      toast.error(result.error);
+    const signedIn = await hasSupabaseSession();
+    if (!signedIn) {
+      setCheckState("no-session");
+      return;
     }
-    setDbBusy(null);
+    const tenants = await listMyTenants();
+    if (!tenants.ok) {
+      setCheckState("error");
+      setDbError(tenants.error);
+      return;
+    }
+    if (tenants.data.length === 0) {
+      setCheckState("error");
+      setDbError(
+        "Signed in to Supabase, but no tenant membership was found for this user.",
+      );
+      return;
+    }
+    const tenant = tenants.data[0];
+    setActiveTenant(tenant);
+    const audit = await fetchAuditEvents(tenant.tenant_id, 8);
+    if (!audit.ok) {
+      setCheckState("error");
+      setDbError(audit.error);
+      return;
+    }
+    setAuditRows(audit.data);
+    setCheckState("ok");
+    toast.success(
+      `Connected as ${tenant.role ?? "member"} in ${tenant.name}.`,
+    );
   };
 
   const toggleNotification = (id: string) => {
@@ -368,22 +369,24 @@ export default function Settings() {
             </CardContent>
           </Card>
 
-          {/* Supabase Postgres integration */}
+          {/* PayRaksha data source — Supabase */}
           <Card className="shadow-card">
             <CardHeader className="flex-row items-start justify-between space-y-0">
               <div>
                 <CardTitle className="flex items-center gap-2 text-base">
                   <Database className="size-4 text-muted-foreground" />
-                  Supabase Postgres
+                  PayRaksha data · Supabase
                 </CardTitle>
                 <CardDescription className="mt-1">
-                  Durable audit log in your Supabase project — reads and writes
-                  the <code className="font-mono text-[11px]">audit_log</code> table.
+                  Read-only check against the PayRaksha schema{" "}
+                  (<code className="font-mono text-[11px]">audit_events</code>,{" "}
+                  <code className="font-mono text-[11px]">payments</code>, …) — reads
+                  are enforced by Row Level Security for your tenant role.
                 </CardDescription>
               </div>
               {supabaseConfig.configured ? (
                 <Badge className="border-transparent bg-success/15 text-success">
-                  Connected
+                  Keys set
                 </Badge>
               ) : (
                 <Badge variant="outline">Not configured</Badge>
@@ -394,41 +397,50 @@ export default function Settings() {
                 <>
                   <div className="flex items-center gap-2 rounded-lg border border-border/70 bg-background/40 px-3 py-2">
                     <span className="size-1.5 rounded-full bg-success" />
-                    <p className="font-mono text-xs text-muted-foreground">
+                    <p className="truncate font-mono text-xs text-muted-foreground">
                       {supabaseConfig.url}
                     </p>
                   </div>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
-                      variant="outline"
                       size="sm"
-                      onClick={() => loadAudit()}
-                      disabled={dbBusy !== null}
+                      onClick={runDataSourceCheck}
+                      disabled={checkState === "checking"}
                     >
-                      {dbBusy === "pull" ? (
+                      {checkState === "checking" ? (
                         <Loader2 className="size-4 animate-spin" />
                       ) : (
                         <RefreshCw className="size-4" />
                       )}
-                      Pull audit events
+                      Check data source
                     </Button>
-                    <Button
-                      size="sm"
-                      onClick={recordProbe}
-                      disabled={dbBusy !== null}
-                    >
-                      {dbBusy === "write" ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <PenLine className="size-4" />
-                      )}
-                      Record test event
-                    </Button>
+                    {activeTenant && (
+                      <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <span className="font-medium text-foreground">
+                          {activeTenant.name}
+                        </span>
+                        <RoleBadge role={activeTenant.role ?? "member"} />
+                      </span>
+                    )}
                   </div>
-                  {dbError && (
-                    <p className="text-xs text-destructive">
-                      {dbError} — run the setup SQL below once in the Supabase
-                      SQL editor.
+                  {checkState === "no-session" && (
+                    <p className="rounded-lg border border-border/70 bg-background/40 px-3 py-2.5 text-xs text-muted-foreground">
+                      Signed in, but not with a Supabase session yet — the app
+                      still authenticates through Convex. After the PayRaksha
+                      auth migration and a Supabase sign-in, this panel will
+                      resolve your tenant and role server-side.
+                    </p>
+                  )}
+                  {checkState === "error" && dbError && (
+                    <p className="rounded-lg border border-danger/30 bg-background/40 px-3 py-2.5 text-xs text-destructive">
+                      {dbError}
+                    </p>
+                  )}
+                  {checkState === "ok" && (
+                    <p className="text-xs text-muted-foreground">
+                      Tenant resolved from your Supabase session; showing the{" "}
+                      {auditRows.length} most recent{" "}
+                      <code className="font-mono text-[11px]">audit_events</code>.
                     </p>
                   )}
                   {auditRows.length > 0 && (
@@ -439,14 +451,14 @@ export default function Settings() {
                           className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/40 px-3 py-2"
                         >
                           <span className="min-w-0 truncate font-mono text-xs">
-                            {row.event_type}
+                            {row.action}
                           </span>
                           <span className="flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
                             <span className="hidden truncate sm:inline">
-                              {row.actor}
+                              {row.actor_role ?? "system"}
                             </span>
                             <span className="font-mono tabular-nums">
-                              {new Date(row.created_at).toLocaleString()}
+                              {new Date(row.occurred_at).toLocaleString()}
                             </span>
                           </span>
                         </li>
@@ -457,8 +469,16 @@ export default function Settings() {
               ) : (
                 <>
                   <p className="text-sm text-muted-foreground">
-                    Add these two keys in the project&apos;s Keys tab to connect,
-                    then create the table once in the Supabase SQL editor.
+                    Add these keys in the project&apos;s Keys tab, then apply the
+                    migrations once in the Supabase SQL editor ({" "}
+                    <code className="font-mono text-[11px]">
+                      supabase/migrations/0001_payraksha_foundation.sql
+                    </code>{" "}
+                    then{" "}
+                    <code className="font-mono text-[11px]">
+                      0002_demo_seed.sql
+                    </code>
+                    ).
                   </p>
                   <div className="flex flex-col gap-1.5">
                     <code className="rounded-md border border-border bg-background/60 px-3 py-2 font-mono text-xs">
@@ -469,14 +489,6 @@ export default function Settings() {
                       anon/publishable key
                     </code>
                   </div>
-                  <details className="group">
-                    <summary className="cursor-pointer text-xs font-medium text-primary">
-                      Setup SQL (run once)
-                    </summary>
-                    <pre className="mt-2 overflow-x-auto rounded-lg border border-border bg-background/60 p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                      {SETUP_SQL}
-                    </pre>
-                  </details>
                 </>
               )}
             </CardContent>
