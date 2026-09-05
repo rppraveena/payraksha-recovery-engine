@@ -41,7 +41,7 @@ The publishable/anon key is safe for the browser. The service-role key must neve
 ```sql
 -- Row counts
 select count(*) from payments;        -- expect 500
-select count(*) from payment_events;  -- expect ~1900+
+select count(*) from payment_events;  -- expect ~2000 (multi-event histories)
 
 -- The critical check — multiple events per payment:
 select p.payment_ref, count(*) as events
@@ -62,7 +62,7 @@ where p.payment_ref = 'PAY-001'
 order by e.occurred_at;
 ```
 
-Expected: 4 rows where two share the same `provider_event_id` (`evt_1_3`) — the dedup contract `UNIQUE(tenant_id, provider_event_id)` absorbed the duplicate webhook.
+Expected: 5 stored rows (created → authorized → failed → recovery.initiated → captured). The retransmitted `payment.failed` webhook carrying the same `provider_event_id` (`evt_1_3`) was absorbed by the dedup contract `UNIQUE(tenant_id, provider_event_id)` — PAY-001 ends in `CAPTURED_AFTER_FAILURE`.
 
 Status distribution:
 
@@ -71,6 +71,14 @@ select status, count(*) from payments group by 1 order by 2 desc;
 ```
 
 Expected mix across all nine states — CAPTURED / CAPTURED_AFTER_FAILURE / RECOVERY_PENDING dominate, with smaller numbers of BLOCKED / ESCALATED / PENDING_REVIEW / RECOVERY_CANCELLED / AUTHORIZED / FAILED.
+
+Also verify the transition + situation + audit tables are populated:
+
+```sql
+select count(*) from state_transitions; -- ~1 event per stored payment_event
+select kind, severity, count(*) from situations group by 1, 2 order by 3 desc;
+select action, count(*) from audit_events group by 1;
+```
 
 ## 6. After verification: switch the UI to Supabase
 

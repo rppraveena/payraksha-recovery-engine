@@ -97,7 +97,9 @@ create table public.payments (
   method text,
   bank text,
   psp text,
-  status public.payment_state not null default 'PENDING_REVIEW',
+  -- Pre-event sentinel state: rows are only ever created here (FAILED), and
+  -- every later change goes through ingest_payment_event() + the contract.
+  status public.payment_state not null default 'FAILED',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (tenant_id, payment_ref)
@@ -224,7 +226,7 @@ as $$
 $$;
 
 -- Role for the caller within a specific tenant.
-create or replace function public.has_role(t tenant_id uuid, roles public.user_role[])
+create or replace function public.has_role(p_tenant uuid, roles public.user_role[])
 returns boolean
 language sql
 stable
@@ -234,13 +236,13 @@ as $$
   select exists (
     select 1 from public.user_roles
     where user_id = auth.uid()
-      and tenant_id = t
+      and tenant_id = p_tenant
       and role = any(roles)
   );
 $$;
 
 -- Tenant of a payment row (kept tiny so policies stay readable).
-create or replace function public.payment_tenant(p payment_id uuid)
+create or replace function public.payment_tenant(p uuid)
 returns uuid
 language sql
 stable
@@ -490,15 +492,20 @@ create policy "user_roles manage by super_admin" on public.user_roles
   using (public.has_any_role(array['super_admin']::public.user_role[]))
   with check (public.has_any_role(array['super_admin']::public.user_role[]));
 
--- payments: tenant-scoped read for every role; writes NEVER go through RLS
--- (no insert/update/delete policy) — status changes only via ingest function.
+-- payments: tenant-scoped read for every role. Inserts are limited to the
+-- pre-event sentinel state (operators registering a payment before its event
+-- history exists). There is NO update policy and NO direct status write path:
+-- every status change happens server-side in ingest_payment_event().
 create policy "payments read same tenant" on public.payments
   for select to authenticated
   using (public.has_role(tenant_id, array['viewer','operator','admin','super_admin']::public.user_role[]));
 
-create policy "payments insert by operators" on public.payments
+create policy "payments register by operators" on public.payments
   for insert to authenticated
-  with check (public.has_role(tenant_id, array['operator','admin','super_admin']::public.user_role[]));
+  with check (
+    public.has_role(tenant_id, array['operator','admin','super_admin']::public.user_role[])
+    and status = 'FAILED'  -- sentinel only; no other state can be set directly
+  );
 
 -- payment_events
 create policy "payment_events read same tenant" on public.payment_events
@@ -560,6 +567,7 @@ create policy "contract read by authenticated" on public.state_transition_contra
 -- ----------------------------------------------------------------------------
 
 revoke all on all tables in schema public from anon;
+revoke execute on function public.ingest_payment_event(uuid, text, public.payment_event_type, timestamptz, jsonb) from anon;
 grant usage on schema public to authenticated;
 grant select on public.state_transition_contract to authenticated;
 grant execute on function public.ingest_payment_event(uuid, text, public.payment_event_type, timestamptz, jsonb) to authenticated;

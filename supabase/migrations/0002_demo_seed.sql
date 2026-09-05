@@ -120,17 +120,29 @@ begin
       v_seq := 3;
 
     elsif v_scenario = 'duplicate_webhook' then
-      -- Same provider_event_id twice: UNIQUE(tenant_id, provider_event_id)
-      -- absorbs the duplicate — the visible dedup story for PAY-001.
+      -- Retransmitted webhook: the second insert carries the SAME
+      -- provider_event_id and is absorbed by UNIQUE(tenant_id,
+      -- provider_event_id). The raw payload records the duplicate attempt.
       insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                      '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '2 min',   '{"source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '7 min',   '{"error_code":"gateway_timeout","source":"seed"}'),
-        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '7 min',   '{"error_code":"gateway_timeout","source":"seed","duplicate_of":"evt_' || i || '_3"}')
+        (v_tenant, v_payment, 'evt_' || i || '_1', 'payment.created',    v_base,                     '{"source":"seed"}'),
+        (v_tenant, v_payment, 'evt_' || i || '_2', 'payment.authorized', v_base + interval '2 min',  '{"source":"seed"}'),
+        (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed',     v_base + interval '7 min',  '{"error_code":"gateway_timeout","source":"seed"}'),
+        (v_tenant, v_payment, 'evt_' || i || '_4', 'recovery.initiated', v_base + interval '25 min', '{"source":"seed"}');
+      -- Duplicate delivery of evt_..._3: silently absorbed by the unique key.
+      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw)
+      values (v_tenant, v_payment, 'evt_' || i || '_3', 'payment.failed', v_base + interval '7 min',
+              '{"error_code":"gateway_timeout","source":"seed","duplicate":true,"duplicate_of":"evt_' || i || '_3"}')
       on conflict (tenant_id, provider_event_id) do nothing;
-      insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
-        (v_tenant, v_payment, 'evt_' || i || '_4', 'recovery.initiated', v_base + interval '25 min',  '{"source":"seed"}');
-      v_seq := 4;
+      -- PAY-001 showcase: also demonstrate the late capture that arrives after
+      -- the failure and finishes the recovery (CAPTURED_AFTER_FAILURE).
+      if i = 1 then
+        insert into public.payment_events (tenant_id, payment_id, provider_event_id, event_type, occurred_at, raw) values
+          (v_tenant, v_payment, 'evt_1_5', 'payment.captured', v_base + interval '50 min',
+           '{"source":"seed","late":true,"recovered":true}');
+        v_seq := 5;
+      else
+        v_seq := 4;
+      end if;
 
     elsif v_scenario = 'out_of_order' then
       -- Webhook ARRIVAL order differs from occurred_at; raw preserves arrival.
@@ -159,18 +171,25 @@ begin
 
     -- ------------------------------------------------------------------
     -- State reconstruction: fold the event history through the explicit
-    -- transition contract, ordered by occurred_at. status is DERIVED.
+    -- transition contract, ordered by occurred_at. Every step is recorded
+    -- in state_transitions; payments.status is DERIVED, never hardcoded.
     -- ------------------------------------------------------------------
     v_state := 'FAILED';
     for r in
-      select e.event_type
+      select e.id as event_id, e.event_type
       from public.payment_events e
       where e.payment_id = v_payment
       order by e.occurred_at, e.created_at
     loop
+      v_next := null;
       select c.to_state into v_next
       from public.state_transition_contract c
       where c.event_type = r.event_type and c.from_state = v_state;
+
+      insert into public.state_transitions (tenant_id, payment_id, event_id, from_state, to_state, applied, rejection_reason)
+      values (v_tenant, v_payment, r.event_id, v_state, coalesce(v_next, v_state), v_next is not null,
+              case when v_next is null then format('%s not allowed from %s', r.event_type, v_state) end);
+
       if v_next is not null and v_next <> v_state then
         v_state := v_next;
       end if;
@@ -248,7 +267,8 @@ $$;
 --   -- multiple events per payment (the PayRaksha story):
 --   select payment_id, count(*) from payment_events group by 1 order by 1 limit 10;
 --
---   -- the PAY-001 duplicate-webhook showcase (3 events, one provider_event_id):
+--   -- the PAY-001 showcase (5 stored events — the retransmitted failed
+--   -- webhook shares evt_1_3 and was absorbed by the unique key):
 --   select p.payment_ref, e.provider_event_id, e.event_type, e.occurred_at
 --   from payments p join payment_events e on e.payment_id = p.id
 --   where p.payment_ref = 'PAY-001' order by e.occurred_at;
