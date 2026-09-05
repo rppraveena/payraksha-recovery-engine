@@ -465,7 +465,8 @@ export default function Settings() {
                       VITE_SUPABASE_URL · your project URL
                     </code>
                     <code className="rounded-md border border-border bg-background/60 px-3 py-2 font-mono text-xs">
-                      VITE_SUPABASE_ANON_KEY · your anon key
+                      VITE_SUPABASE_ANON_KEY (or VITE_SUPABASE_PUBLISHABLE_KEY) · your
+                      anon/publishable key
                     </code>
                   </div>
                   <details className="group">

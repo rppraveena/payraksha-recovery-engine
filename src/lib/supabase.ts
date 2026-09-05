@@ -5,7 +5,8 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
  *
  * The client is created lazily from Vite environment variables:
  *   - VITE_SUPABASE_URL        — Project URL, e.g. https://abc123.supabase.co
- *   - VITE_SUPABASE_ANON_KEY   — Public anon (publishable) key
+ *   - VITE_SUPABASE_ANON_KEY          — Public anon key (preferred)
+ *   - VITE_SUPABASE_PUBLISHABLE_KEY   — Same value under Supabase's new key name; used as fallback
  *
  * Add both in the project's Keys tab. Until they exist the app keeps working
  * and every helper returns { ok: false, reason: "config" } so callers can
@@ -28,7 +29,8 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
  */
 
 const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+const anonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ??
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY) as string | undefined;
 
 export const supabaseConfig = {
   url: url ?? "",
@@ -36,7 +38,7 @@ export const supabaseConfig = {
   configured: Boolean(url && anonKey),
 };
 
-/** Client instance, or null until VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY are set. */
+/** Client instance, or null until VITE_SUPABASE_URL and an anon/publishable key are set. */
 export const supabase: SupabaseClient | null = supabaseConfig.configured
   ? createClient(url!, anonKey!)
   : null;
