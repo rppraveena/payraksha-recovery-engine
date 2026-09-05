@@ -41,8 +41,11 @@ declare
   v_ref text;
   v_amount numeric;
   v_method text;
+  v_methods text[];
   v_bank text;
+  v_banks text[];
   v_psp text;
+  v_psps text[];
   v_currency text;
   v_status payment_status;
   v_i int;
@@ -132,7 +135,7 @@ begin
 
     -- Insert payment
     insert into payments (id, tenant_id, payment_ref, amount, currency, method, bank, psp, status, created_at, updated_at)
-    values (uuid_generate_v4(), v_tenant, v_ref, v_amount, v_currency, v_method, v_bank, v_psp, v_status, v_event_ts, v_event_ts + interval '1 hour')
+    values (gen_random_uuid(), v_tenant, v_ref, v_amount, v_currency, v_method, v_bank, v_psp, v_status, v_event_ts, v_event_ts + interval '1 hour')
     returning id into v_payment_id;
 
     -- Insert events
