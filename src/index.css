@@ -1,0 +1,297 @@
+/* ============================================================================
+   MERIDIAN DESIGN SYSTEM — "Modern" theme (dark fintech)
+   ============================================================================
+   v1 scope: every design token is exported as a CSS variable below (single
+   source of truth) and mapped into the Tailwind v4 theme so components use
+   the tokens — never hardcoded values. Color, typography, spacing, radius,
+   shadow, motion and breakpoint tokens are consumed by every page (landing,
+   dashboard, payments, investigations, settings, admin).
+
+   Token glossary
+   --------------
+   Palette (spec): Primary #1a1a2e / #0f0f1a / #1e1e32 · Accent #4a6fa5
+                   Success #10b981 · Warning #f59e0b · Danger #ef4444
+   - "Primary" tones define the dark surfaces: page background, cards and the
+     elevated sidebar surface.
+   - "Accent" is the refined action color: CTAs, links, focus rings, charts.
+   - shadcn semantic aliases (--color-*) are derived from these tokens so the
+     existing component library (buttons, badges, tables, switches…) resolves
+     to the same palette everywhere.
+
+   Typography: Inter (sans) + JetBrains Mono (mono). Size / weight / leading
+   scales are exported and match the utility scale (text-xs … text-5xl).
+
+   Spacing: xs (4px) → 3xl (64px), mapped so utilities like p-md, gap-lg, mt-xl
+   resolve to the token scale (numeric utilities keep the 4px base grid).
+
+   Radius: sm (4px) → xl (16px).  Shadows: xs → lg + card.  Motion: fast/base/
+   slow + standard/emphasized easing.  Breakpoints: sm … 2xl.
+   ============================================================================
+*/
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@custom-variant dark (&:is(.dark *));
+
+/* 1. DESIGN TOKENS — single source of truth --------------------------------- */
+:root {
+  color-scheme: dark;
+
+  /* 1a. Brand palette (spec) */
+  --primary: #1a1a2e; /* brand primary — elevated surface (sidebar, muted) */
+  --primary-deep: #0f0f1a; /* deepest surface — page background */
+  --primary-soft: #1e1e32; /* soft surface — cards */
+  --accent: #4a6fa5; /* brand accent — primary actions, links, focus */
+  --accent-strong: #6a8fc4; /* accent lightened for text/icons on dark */
+  --accent-soft: #22314a; /* accent-tinted surface for hovers / selection */
+  --success: #10b981; /* success status */
+  --warning: #f59e0b; /* warning status */
+  --danger: #ef4444; /* danger / destructive status */
+
+  /* 1b. Semantic colors (shadcn-compatible) */
+  --background: var(--primary-deep);
+  --foreground: #e9edf5;
+  --card: var(--primary-soft);
+  --card-foreground: #e9edf5;
+  --popover: #23233f;
+  --popover-foreground: #e9edf5;
+  --primary-foreground: #f4f7fc;
+  --secondary: #242442;
+  --secondary-foreground: #e9edf5;
+  --muted: var(--primary);
+  --muted-foreground: #9aa4bb;
+  --accent-foreground: #e2eaf7;
+  --destructive: var(--danger);
+  --border: #2b2b4a;
+  --input: #33335c;
+  --ring: var(--accent);
+  --chart-1: #4a6fa5; /* accent */
+  --chart-2: #10b981; /* success */
+  --chart-3: #f59e0b; /* warning */
+  --chart-4: #8b7cf6;
+  --chart-5: #e0618a;
+  --sidebar: var(--primary);
+  --sidebar-foreground: #ccd4e5;
+  --sidebar-primary: var(--accent);
+  --sidebar-primary-foreground: #f4f7fc;
+  --sidebar-accent: var(--accent-soft);
+  --sidebar-accent-foreground: #e9edf5;
+  --sidebar-border: #262646;
+  --sidebar-ring: var(--accent);
+
+  /* 1c. Typography */
+  --font-family-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-family-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* sizes */
+  --text-xs: 0.75rem; /* 12px */
+  --text-sm: 0.875rem; /* 14px */
+  --text-base: 1rem; /* 16px */
+  --text-lg: 1.125rem; /* 18px */
+  --text-xl: 1.25rem; /* 20px */
+  --text-2xl: 1.5rem; /* 24px */
+  --text-3xl: 1.875rem; /* 30px */
+  --text-4xl: 2.25rem; /* 36px */
+  --text-5xl: 3rem; /* 48px */
+
+  /* weights */
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* line heights */
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+
+  /* 1d. Spacing scale */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 40px;
+  --space-3xl: 64px;
+
+  /* 1e. Border radius */
+  --radius: 8px; /* base radius (dialogs, toasts) */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 16px;
+
+  /* 1f. Shadows */
+  --shadow-xs: 0 1px 2px rgb(4 8 24 / 0.35);
+  --shadow-sm: 0 1px 2px rgb(4 8 24 / 0.3), 0 2px 10px -2px rgb(4 8 24 / 0.4);
+  --shadow-md: 0 2px 6px -1px rgb(4 8 24 / 0.4),
+    0 12px 28px -8px rgb(4 8 24 / 0.5);
+  --shadow-lg: 0 6px 16px -4px rgb(4 8 24 / 0.45),
+    0 24px 56px -12px rgb(4 8 24 / 0.6);
+  --shadow-card: 0 1px 2px rgb(4 8 24 / 0.25),
+    0 10px 32px -16px rgb(4 8 24 / 0.55);
+
+  /* 1g. Motion */
+  --transition-fast: 120ms;
+  --transition-base: 200ms;
+  --transition-slow: 320ms;
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* 1h. Breakpoints */
+  --breakpoint-sm: 40rem; /* 640px */
+  --breakpoint-md: 48rem; /* 768px */
+  --breakpoint-lg: 64rem; /* 1024px */
+  --breakpoint-xl: 80rem; /* 1280px */
+  --breakpoint-2xl: 96rem; /* 1536px */
+}
+
+/* 2. THEME MAPPING — expose tokens as Tailwind utilities -------------------- */
+/* Every utility (bg-card, text-muted-foreground, rounded-xl, shadow-sm,
+   gap-lg, font-mono, lg:…) resolves to the token above. */
+@theme inline {
+  /* colors */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent-soft);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-danger: var(--danger);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* typography */
+  --font-sans: var(--font-family-sans);
+  --font-mono: var(--font-family-mono);
+
+  /* radius */
+  --radius-xs: var(--radius-xs);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+
+  /* spacing scale (named utilities: p-md, gap-lg, mt-3xl …) */
+  --spacing-xs: var(--space-xs);
+  --spacing-sm: var(--space-sm);
+  --spacing-md: var(--space-md);
+  --spacing-lg: var(--space-lg);
+  --spacing-xl: var(--space-xl);
+  --spacing-2xl: var(--space-2xl);
+  --spacing-3xl: var(--space-3xl);
+
+  /* shadows */
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-card: var(--shadow-card);
+
+  /* motion defaults */
+  --default-transition-duration: var(--transition-base);
+  --default-transition-timing-function: var(--ease-standard);
+
+  /* breakpoints — literal values, kept in sync with the --breakpoint-*
+     tokens above. Tailwind must inline these at build time because CSS
+     custom properties are not supported inside @media queries. */
+  --breakpoint-sm: 40rem;
+  --breakpoint-md: 48rem;
+  --breakpoint-lg: 64rem;
+  --breakpoint-xl: 80rem;
+  --breakpoint-2xl: 96rem;
+}
+
+/* 3. BASE STYLES ------------------------------------------------------------ */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-family-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--foreground);
+  }
+
+  /* slim, token-colored scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+}
+
+/* 4. GLOBAL UTILITIES ------------------------------------------------------- */
+@layer utilities {
+  /* layered dark surface — soft elevation on top of the page background */
+  .bg-surface {
+    background: var(--card);
+  }
+
+  /* quiet accent-tinted surface (chips, selected rows, icon wells) */
+  .bg-accent-tint {
+    background: var(--accent-soft);
+  }
+
+  /* app backdrop — faint radial glow behind the product UI */
+  .bg-app-glow {
+    background:
+      radial-gradient(
+        58rem 32rem at 85% -8rem,
+        rgb(74 111 165 / 0.14),
+        transparent 62%
+      ),
+      radial-gradient(
+        42rem 26rem at -10% 22rem,
+        rgb(74 111 165 / 0.08),
+        transparent 60%
+      ),
+      var(--background);
+  }
+
+  /* thin horizontal rule using the border token */
+  .hairline {
+    @apply border-border;
+  }
+}
